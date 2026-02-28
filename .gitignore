@@ -1,12 +1,15 @@
 # Python caches
 __pycache__/
 *.py[cod]
+*.egg-info/
+ragdag.egg-info/
 
 # Test/runtime caches
 .pytest_cache/
 
 # Agent/generated artifacts
 .claude/cache/
+TEST_PLAN.md
 
 # Local planning artifacts
 thoughts/shared/plans/

@@ -1,7 +1,10 @@
 .git
 .gitignore
 .claude
+.claude/cache
 .ragdag
+thoughts/shared/plans
+TEST_PLAN.md
 __pycache__
 *.pyc
 *.egg-info
