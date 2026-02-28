@@ -1,0 +1,15 @@
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Test/runtime caches
+.pytest_cache/
+
+# Agent/generated artifacts
+.claude/cache/
+
+# Local planning artifacts
+thoughts/shared/plans/
+
+# Local ragdag store data
+.ragdag/
