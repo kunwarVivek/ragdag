@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ragdag"
+version = "1.0.0"
+description = "A knowledge graph engine that runs on flat files and bash"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+
+dependencies = [
+    "numpy>=1.20",
+]
+
+[project.optional-dependencies]
+openai = ["openai>=1.0"]
+anthropic = ["anthropic>=0.20"]
+local = ["sentence-transformers>=2.0", "torch"]
+server = [
+    "fastapi>=0.100",
+    "uvicorn>=0.20",
+]
+mcp = ["fastmcp>=0.1"]
+all = [
+    "openai>=1.0",
+    "anthropic>=0.20",
+    "numpy>=1.20",
+    "fastapi>=0.100",
+    "uvicorn>=0.20",
+    "fastmcp>=0.1",
+]
+
+[project.scripts]
+ragdag-server = "server.api:run"
+ragdag-mcp = "server.mcp:run"
+
+[tool.setuptools.package-dir]
+ragdag = "sdk/ragdag"
+engines = "engines"
+server = "server"
+
+[tool.setuptools.packages]
+find = {include = ["ragdag*", "engines*", "server*"]}

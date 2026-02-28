@@ -1,0 +1,11 @@
+.git
+.gitignore
+.claude
+.ragdag
+__pycache__
+*.pyc
+*.egg-info
+.pytest_cache
+tests
+docs
+*.md

@@ -1,0 +1,35 @@
+version: "3.8"
+
+services:
+  ragdag:
+    build: .
+    ports:
+      - "8420:8420"
+    volumes:
+      - ragdag-data:/data
+    environment:
+      - RAGDAG_STORE=/data
+      # Uncomment and set for embedding/LLM support:
+      # - OPENAI_API_KEY=${OPENAI_API_KEY}
+      # - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8420/health')"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # MCP server mode (stdio transport, for piping)
+  ragdag-mcp:
+    build: .
+    profiles: ["mcp"]
+    volumes:
+      - ragdag-data:/data
+    environment:
+      - RAGDAG_STORE=/data
+    stdin_open: true
+    command: ["python3", "-c", "import sys; sys.path.insert(0, '/app'); sys.path.insert(0, '/app/sdk'); from server.mcp import run; run()"]
+
+volumes:
+  ragdag-data:

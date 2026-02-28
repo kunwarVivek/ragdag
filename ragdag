@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# ragdag — A knowledge graph engine that runs on flat files and bash.
+# https://github.com/<org>/ragdag
+set -euo pipefail
+
+RAGDAG_VERSION="1.0.0"
+RAGDAG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Load compatibility layer
+source "${RAGDAG_DIR}/lib/compat.sh"
+
+# Load config helpers (needed by most commands)
+source "${RAGDAG_DIR}/lib/config.sh"
+
+ragdag_help() {
+  cat <<EOF
+ragdag v${RAGDAG_VERSION} — A knowledge graph engine on flat files and bash
+
+Usage: ragdag <command> [options]
+
+Commands:
+  init [path]                    Initialize a new ragdag store
+  add <path> [options]           Ingest documents
+  search "<query>" [options]     Search the corpus
+  ask "<question>" [options]     Ask a question (RAG)
+  graph [domain/]                Show graph summary
+  neighbors <node>               Show connected nodes
+  trace <node>                   Show provenance chain
+  relate [domain/]               Compute semantic edges
+  link <src> <dst> <type>        Create a manual edge
+  config [get|set] [key] [val]   Manage configuration
+  serve [--http|--mcp]           Start a server
+  verify                         Check store integrity
+  repair                         Fix store issues
+  gc                             Garbage collect
+  reindex [domain/]              Rebuild embeddings
+  version                        Show version
+  help                           Show this help
+
+Options:
+  --domain <name|auto>           Organize by domain
+  --flat                         No domain organization
+  --keyword                      Keyword-only search
+  --vector                       Vector-only search
+  --top <n>                      Number of results (default: 10)
+  --json                         JSON output
+  --no-embed                     Skip embedding on ingest
+  --no-llm                       Skip LLM on ask (show context only)
+  --debug                        Enable debug output
+
+Environment:
+  RAGDAG_STORE                   Path to .ragdag store (auto-detected)
+  RAGDAG_DEBUG                   Set to 1 for debug output
+  OPENAI_API_KEY                 For OpenAI embeddings/LLM
+  ANTHROPIC_API_KEY              For Anthropic LLM
+
+EOF
+}
+
+# Main command router
+main() {
+  # Handle global flags
+  for arg in "$@"; do
+    case "$arg" in
+      --debug) export RAGDAG_DEBUG=1 ;;
+    esac
+  done
+
+  case "${1:-}" in
+    init)
+      shift
+      source "${RAGDAG_DIR}/lib/init.sh"
+      ragdag_init "$@"
+      ;;
+    add)
+      shift
+      source "${RAGDAG_DIR}/lib/add.sh"
+      ragdag_add "$@"
+      ;;
+    search)
+      shift
+      source "${RAGDAG_DIR}/lib/search.sh"
+      ragdag_search "$@"
+      ;;
+    ask)
+      shift
+      source "${RAGDAG_DIR}/lib/ask.sh"
+      ragdag_ask "$@"
+      ;;
+    graph)
+      shift
+      source "${RAGDAG_DIR}/lib/graph.sh"
+      ragdag_graph "$@"
+      ;;
+    neighbors)
+      shift
+      source "${RAGDAG_DIR}/lib/graph.sh"
+      ragdag_neighbors "$@"
+      ;;
+    trace)
+      shift
+      source "${RAGDAG_DIR}/lib/graph.sh"
+      ragdag_trace "$@"
+      ;;
+    relate)
+      shift
+      source "${RAGDAG_DIR}/lib/graph.sh"
+      ragdag_relate "$@"
+      ;;
+    link)
+      shift
+      source "${RAGDAG_DIR}/lib/graph.sh"
+      ragdag_link "$@"
+      ;;
+    config)
+      shift
+      ragdag_config "$@"
+      ;;
+    serve)
+      shift
+      source "${RAGDAG_DIR}/lib/serve.sh"
+      ragdag_serve "$@"
+      ;;
+    verify)
+      shift
+      source "${RAGDAG_DIR}/lib/maintain.sh"
+      ragdag_verify "$@"
+      ;;
+    repair)
+      shift
+      source "${RAGDAG_DIR}/lib/maintain.sh"
+      ragdag_repair "$@"
+      ;;
+    gc)
+      shift
+      source "${RAGDAG_DIR}/lib/maintain.sh"
+      ragdag_gc "$@"
+      ;;
+    reindex)
+      shift
+      source "${RAGDAG_DIR}/lib/maintain.sh"
+      ragdag_reindex "$@"
+      ;;
+    version|--version|-v)
+      echo "ragdag v${RAGDAG_VERSION}"
+      ;;
+    help|--help|-h|"")
+      ragdag_help
+      ;;
+    *)
+      ragdag_error "Unknown command: $1"
+      echo "Run 'ragdag help' for usage."
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
