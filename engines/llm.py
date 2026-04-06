@@ -22,6 +22,25 @@ def _build_user_message(question: str, context: str) -> str:
     )
 
 
+def call_llm(
+    system_msg: str,
+    user_msg: str,
+    provider: str = "openai",
+    model: str = "gpt-4o-mini",
+) -> str:
+    """Low-level LLM call. Routes to the configured provider."""
+    if provider == "none":
+        return ""
+    if provider == "openai":
+        return _openai_answer(system_msg, user_msg, model)
+    elif provider == "anthropic":
+        return _anthropic_answer(system_msg, user_msg, model)
+    elif provider == "ollama":
+        return _ollama_answer(system_msg, user_msg, model)
+    else:
+        raise ValueError(f"Unknown LLM provider: {provider}")
+
+
 def get_answer(
     question: str,
     context: str,
@@ -33,16 +52,7 @@ def get_answer(
         return ""
 
     user_msg = _build_user_message(question, context)
-    system_msg = SYSTEM_PROMPT
-
-    if provider == "openai":
-        return _openai_answer(system_msg, user_msg, model)
-    elif provider == "anthropic":
-        return _anthropic_answer(system_msg, user_msg, model)
-    elif provider == "ollama":
-        return _ollama_answer(system_msg, user_msg, model)
-    else:
-        raise ValueError(f"Unknown LLM provider: {provider}")
+    return call_llm(SYSTEM_PROMPT, user_msg, provider, model)
 
 
 def _openai_answer(system_msg: str, user_msg: str, model: str) -> str:

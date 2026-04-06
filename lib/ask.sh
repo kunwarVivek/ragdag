@@ -72,7 +72,7 @@ ragdag_ask() {
   # Find matching chunks
   local chunk_files_tmp
   chunk_files_tmp="$(ragdag_mktemp_dir)/chunk_files.txt"
-  find "$search_path" -name '*.txt' -type f ! -name '_*' > "$chunk_files_tmp" 2>/dev/null
+  find "$search_path" -name '*.txt' -type f > "$chunk_files_tmp" 2>/dev/null
 
   while IFS= read -r chunk_file; do
     [[ -f "$chunk_file" ]] || continue
@@ -223,9 +223,44 @@ print(json.dumps({'answer': None, 'context': ctx, 'sources': sources}))
   [[ "$no_llm" -eq 1 ]] && args+=(--no-llm)
   [[ "$json_output" -eq 1 ]] && args+=(--json)
 
-  python3 "$ask_script" "${args[@]}"
+  # Capture answer for potential filing
+  local answer_tmp
+  answer_tmp="$(ragdag_mktemp_dir)/answer.txt"
+  python3 "$ask_script" "${args[@]}" | tee "$answer_tmp"
 
-  # Step 5: Record query (if enabled)
+  # Step 5: File answer back (if synthesis enabled)
+  local on_query
+  on_query="$(ragdag_config_get_from "$config_file" synthesis.on_query off)"
+  if [[ "$on_query" != "off" ]] && [[ -s "$answer_tmp" ]] && ragdag_has python3; then
+    local synth_script="${RAGDAG_DIR}/engines/synthesis_cli.py"
+    if [[ -f "$synth_script" ]]; then
+      # Collect source paths from context
+      local source_paths="[]"
+      if ragdag_has python3; then
+        source_paths=$(python3 -c "
+import json, sys
+sources = []
+for line in open('$context_file'):
+    if line.startswith('--- Source:'):
+        path = line.replace('--- Source:', '').strip()
+        if ' (score:' in path:
+            path = path.split(' (score:')[0].strip()
+        sources.append(path)
+print(json.dumps(sources))
+" 2>/dev/null || echo "[]")
+      fi
+      local answer_text
+      answer_text="$(cat "$answer_tmp")"
+      python3 "$synth_script" file-answer \
+        --store-dir "$store_dir" \
+        --question "$question" \
+        --answer "$answer_text" \
+        --sources "$source_paths" \
+        2>/dev/null || ragdag_debug "Answer filing failed"
+    fi
+  fi
+
+  # Step 6: Record query (if enabled)
   local record_queries
   record_queries="$(ragdag_config_get_from "$config_file" edges.record_queries false)"
   if [[ "$record_queries" == "true" ]]; then

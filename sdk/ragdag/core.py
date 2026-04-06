@@ -117,7 +117,13 @@ class RagDag:
                 "[edges]\n"
                 "auto_relate = false\n"
                 "relate_threshold = 0.8\n"
-                "record_queries = false\n"
+                "record_queries = false\n\n"
+                "[synthesis]\n"
+                "enabled = false\n"
+                "on_ingest = summary,entities\n"
+                "on_query = off\n"
+                "on_relate = clusters\n"
+                "synthesis_boost = 1.2\n"
             )
 
         for f in [".edges", ".processed", ".domain-rules"]:
@@ -202,9 +208,14 @@ class RagDag:
                 target_dir = self._store / doc_name
             target_dir.mkdir(parents=True, exist_ok=True)
 
-            # Remove old chunks
+            # Mark existing synthesis nodes as stale before replacing chunks
+            if target_dir.exists():
+                self._mark_synthesis_stale(target_dir)
+
+            # Remove old raw chunks (preserve _ synthesis nodes)
             for old in target_dir.glob("*.txt"):
-                old.unlink()
+                if not old.name.startswith("_"):
+                    old.unlink()
 
             # Write new chunks
             for i, chunk_text in enumerate(chunks, 1):
@@ -221,6 +232,10 @@ class RagDag:
             # Embed
             if embed and embed_provider != "none":
                 self._embed_chunks(target_dir, rel_path, file_domain)
+
+            # Synthesis (if enabled)
+            if self._read_config("synthesis.enabled", "false") == "true":
+                self._synthesize_on_ingest(target_dir, rel_path, file_domain)
 
             total_files += 1
             total_chunks += len(chunks)
@@ -623,6 +638,178 @@ class RagDag:
         except Exception:
             pass  # Embedding failure doesn't block ingest
 
+    def _synthesize_on_ingest(self, target_dir: Path, doc_rel_path: str, domain: str):
+        """Run ingest-time synthesis: summary + entity extraction."""
+        try:
+            sys.path.insert(0, str(self._ragdag_dir))
+            from engines.synthesis import (
+                summarize_chunks,
+                extract_entities,
+                write_synthesis_node,
+                chunk_file_hash,
+                read_frontmatter,
+                read_body,
+            )
+
+            provider = self._read_config("llm.provider", "none")
+            model = self._read_config("llm.model", "gpt-4o-mini")
+            on_ingest = self._read_config("synthesis.on_ingest", "summary,entities")
+
+            if provider == "none":
+                return
+
+            # Read raw chunks (non _ prefixed)
+            chunk_files = sorted(
+                f for f in target_dir.glob("*.txt") if not f.name.startswith("_")
+            )
+            if not chunk_files:
+                return
+
+            chunks = []
+            source_paths = []
+            source_hashes = []
+            for f in chunk_files:
+                chunks.append(f.read_text(encoding="utf-8"))
+                source_paths.append(str(f.relative_to(self._store)))
+                source_hashes.append(chunk_file_hash(f))
+
+            edges_file = self._edges_path()
+            new_edges = []
+
+            # Summary
+            if "summary" in on_ingest:
+                summary = summarize_chunks(chunks, provider, model)
+                summary_path = target_dir / "_summary.txt"
+                write_synthesis_node(
+                    summary_path, summary, "summary", source_paths, source_hashes
+                )
+                summary_rel = str(summary_path.relative_to(self._store))
+                for src in source_paths:
+                    new_edges.append(f"{summary_rel}\t{src}\tderived_from\tingest")
+
+            # Entity extraction
+            if "entities" in on_ingest:
+                entities = extract_entities(chunks, provider, model)
+                for ent in entities:
+                    name = _sanitize(ent.get("name", "unknown").replace(" ", "_"))[:50]
+                    etype = ent.get("type", "entity")
+                    desc = ent.get("description", "")
+                    node_name = f"_{etype}_{name}.txt"
+                    node_path = target_dir / node_name
+
+                    if node_path.exists():
+                        existing_fm = read_frontmatter(node_path)
+                        existing_body = read_body(node_path)
+                        if existing_fm:
+                            merged_sources = list(set(
+                                existing_fm.get("sources", []) + source_paths
+                            ))
+                            merged_hashes = list(set(
+                                existing_fm.get("source_hashes", []) + source_hashes
+                            ))
+                            merged_body = existing_body.strip() + "\n\n" + desc
+                            write_synthesis_node(
+                                node_path, merged_body, etype,
+                                merged_sources, merged_hashes,
+                            )
+                        else:
+                            write_synthesis_node(
+                                node_path, desc, etype, source_paths, source_hashes
+                            )
+                    else:
+                        write_synthesis_node(
+                            node_path, desc, etype, source_paths, source_hashes
+                        )
+
+                    node_rel = str(node_path.relative_to(self._store))
+                    for src in source_paths:
+                        new_edges.append(f"{node_rel}\t{src}\tderived_from\tingest")
+
+            # Append edges
+            if new_edges:
+                with open(edges_file, "a") as f:
+                    for edge in new_edges:
+                        f.write(edge + "\n")
+
+            # Embed synthesis nodes
+            self._embed_synthesis_nodes(target_dir, doc_rel_path, domain)
+
+        except Exception:
+            pass  # Synthesis failure doesn't block ingest
+
+    def _mark_synthesis_stale(self, target_dir: Path):
+        """Mark all synthesis nodes in a directory as stale."""
+        try:
+            sys.path.insert(0, str(self._ragdag_dir))
+            from engines.synthesis import mark_stale, is_synthesis_node
+            for f in target_dir.glob("_*.txt"):
+                if is_synthesis_node(f):
+                    mark_stale(f)
+        except Exception:
+            pass
+
+        # Also check _queries and _synthesis for nodes referencing this dir
+        try:
+            from engines.synthesis import read_frontmatter, mark_stale as _mark
+
+            doc_prefix = str(target_dir.relative_to(self._store))
+            for synth_dir_name in ("_queries", "_synthesis"):
+                synth_dir = self._store / synth_dir_name
+                if not synth_dir.exists():
+                    continue
+                for f in synth_dir.glob("_*.txt"):
+                    fm = read_frontmatter(f)
+                    if fm and any(s.startswith(doc_prefix + "/") for s in fm.get("sources", [])):
+                        _mark(f)
+        except Exception:
+            pass
+
+    def _embed_synthesis_nodes(self, doc_dir: Path, doc_prefix: str, domain: str):
+        """Embed _ prefixed synthesis nodes."""
+        try:
+            sys.path.insert(0, str(self._ragdag_dir))
+            from engines.embeddings import write_embeddings
+            from engines.synthesis import read_body
+
+            provider = self._read_config("embedding.provider", "none")
+            model = self._read_config("embedding.model", "text-embedding-3-small")
+            dims = int(self._read_config("embedding.dimensions", "1536"))
+
+            if provider == "openai":
+                from engines.openai_engine import OpenAIEngine
+                engine = OpenAIEngine(model=model, dims=dims)
+            elif provider == "local":
+                from engines.local_engine import LocalEngine
+                engine = LocalEngine(model=model, dims=dims)
+            else:
+                return
+
+            texts, paths = [], []
+            for f in sorted(doc_dir.glob("_*.txt")):
+                t = read_body(f).strip()
+                if t:
+                    texts.append(t)
+                    paths.append(f"{doc_prefix}/{f.name}")
+
+            if not texts:
+                return
+
+            vectors = engine.embed(texts)
+
+            embed_dir = self._store / domain if domain else self._store
+            embed_dir.mkdir(parents=True, exist_ok=True)
+
+            write_embeddings(
+                output_dir=str(embed_dir),
+                vectors=vectors,
+                chunk_paths=paths,
+                dimensions=engine.dimensions(),
+                model_name_str=engine.model_name(),
+                append=True,
+            )
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------
     # Search (pure Python)
     # ------------------------------------------------------------------
@@ -643,6 +830,10 @@ class RagDag:
         except Exception:
             return self._keyword_search(query, domain, top)
 
+    def _synthesis_boost(self) -> float:
+        """Get the synthesis boost factor from config."""
+        return float(self._read_config("synthesis.synthesis_boost", "1.2"))
+
     def _keyword_search(
         self, query: str, domain: Optional[str], top: int
     ) -> List[SearchResult]:
@@ -650,17 +841,27 @@ class RagDag:
         search_path = self._store / domain if domain else self._store
         query_lower = query.lower()
         words = [w for w in query_lower.split() if len(w) >= 2]
+        boost = self._synthesis_boost()
 
         results = []
         for txt_file in search_path.rglob("*.txt"):
-            if txt_file.name.startswith("_"):
+            # Skip hidden/metadata files but include _ synthesis nodes
+            if txt_file.name.startswith("."):
                 continue
             try:
                 content = txt_file.read_text(encoding="utf-8")
             except Exception:
                 continue
 
-            content_lower = content.lower()
+            # For synthesis nodes, search only the body (after frontmatter)
+            is_synth = txt_file.name.startswith("_")
+            search_content = content
+            if is_synth and content.startswith("---\n"):
+                end = content.find("\n---\n", 4)
+                if end != -1:
+                    search_content = content[end + 5:]
+
+            content_lower = search_content.lower()
             content_len = len(content_lower)
             if content_len == 0:
                 continue
@@ -669,11 +870,18 @@ class RagDag:
 
             if match_count > 0:
                 score = match_count / content_len
+                # Boost synthesized nodes; reduce boost for stale ones
+                if is_synth:
+                    if "stale: true" in content:
+                        score *= boost * 0.5
+                    else:
+                        score *= boost
                 rel_path = str(txt_file.relative_to(self._store))
                 parts = rel_path.split("/")
                 domain_name = parts[0] if len(parts) >= 3 else ""
                 results.append(SearchResult(
-                    path=rel_path, score=score, content=content, domain=domain_name,
+                    path=rel_path, score=score, content=search_content,
+                    domain=domain_name,
                 ))
 
         results.sort(key=lambda r: r.score, reverse=True)
@@ -726,11 +934,20 @@ class RagDag:
             max_kw = max(kw_scores.values()) if kw_scores else 1.0
             max_vec = max(s for _, s in vec_results) if vec_results else 1.0
 
+            boost = self._synthesis_boost()
             fused = []
             for path, vec_score in vec_results:
                 ks = (kw_scores.get(path, 0.0) / max_kw) if max_kw > 1e-10 else 0.0
                 vs = (vec_score / max_vec) if max_vec > 1e-10 else 0.0
                 final_score = kw_weight * ks + vec_weight * vs
+                # Boost synthesized nodes
+                basename = path.rsplit("/", 1)[-1] if "/" in path else path
+                if basename.startswith("_"):
+                    node_path = self._store / path
+                    if node_path.exists() and "stale: true" in node_path.read_text(encoding="utf-8")[:200]:
+                        final_score *= boost * 0.5
+                    else:
+                        final_score *= boost
                 fused.append((path, final_score))
 
             fused.sort(key=lambda x: x[1], reverse=True)
@@ -784,11 +1001,17 @@ class RagDag:
                     if len(parts) < 3:
                         continue
                     source, target, etype = parts[0], parts[1], parts[2]
-                    if source == r.path and etype in ("related_to", "references"):
+                    # Follow related_to, references, and derived_from edges
+                    if source == r.path and etype in ("related_to", "references", "derived_from"):
                         if target not in seen_paths:
                             target_file = self._store / target
                             if target_file.exists():
                                 content = target_file.read_text(encoding="utf-8")
+                                # Strip frontmatter from synthesis nodes
+                                if content.startswith("---\n"):
+                                    fm_end = content.find("\n---\n", 4)
+                                    if fm_end != -1:
+                                        content = content[fm_end + 5:]
                                 expanded.append(SearchResult(
                                     path=target, score=r.score * 0.8,
                                     content=content,
@@ -834,7 +1057,53 @@ class RagDag:
             model=llm_model,
         )
 
+        # File answer back into the store (if enabled)
+        on_query = self._read_config("synthesis.on_query", "off")
+        if on_query != "off" and answer:
+            self._file_answer(question, answer, sources)
+
         return AskResult(answer=answer, context=context, sources=sources)
+
+    def _file_answer(self, question: str, answer: str, sources: List[str]):
+        """File an answer back into the store as a synthesis node."""
+        try:
+            sys.path.insert(0, str(self._ragdag_dir))
+            from engines.synthesis import write_synthesis_node, content_hash, chunk_file_hash
+
+            queries_dir = self._store / "_queries"
+            queries_dir.mkdir(parents=True, exist_ok=True)
+
+            answer_hash = content_hash(question)
+            answer_path = queries_dir / f"_answer_{answer_hash}.txt"
+
+            source_hashes = []
+            for src in sources:
+                src_path = self._store / src
+                if src_path.exists():
+                    source_hashes.append(chunk_file_hash(src_path))
+                else:
+                    source_hashes.append("")
+
+            write_synthesis_node(
+                answer_path,
+                f"Question: {question}\n\nAnswer: {answer}",
+                "answer",
+                sources,
+                source_hashes,
+            )
+
+            # Add edges
+            edges_file = self._edges_path()
+            answer_rel = str(answer_path.relative_to(self._store))
+            with open(edges_file, "a") as f:
+                for src in sources:
+                    f.write(f"{answer_rel}\t{src}\tderived_from\tquery\n")
+
+            # Embed the answer node
+            self._embed_synthesis_nodes(queries_dir, "_queries", "")
+
+        except Exception:
+            pass  # Answer filing failure doesn't block the response
 
     # ------------------------------------------------------------------
     # Graph
@@ -925,7 +1194,7 @@ class RagDag:
                 if len(parts) < 3:
                     continue
                 source, target, etype = parts[0], parts[1], parts[2]
-                if source == current and etype in ("chunked_from", "derived_via"):
+                if source == current and etype in ("chunked_from", "derived_via", "derived_from", "synthesizes"):
                     parent = target
                     chain.append({"node": current, "parent": target, "edge_type": etype})
                     break

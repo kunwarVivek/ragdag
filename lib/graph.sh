@@ -151,7 +151,7 @@ ragdag_trace() {
 
     # Find chunked_from or derived_via edge where current is source
     local parent
-    parent=$(awk -F'\t' -v c="$current" '$1 == c && ($3 == "chunked_from" || $3 == "derived_via") {print $2; exit}' "$edges_file" 2>/dev/null)
+    parent=$(awk -F'\t' -v c="$current" '$1 == c && ($3 == "chunked_from" || $3 == "derived_via" || $3 == "derived_from" || $3 == "synthesizes") {print $2; exit}' "$edges_file" 2>/dev/null)
 
     if [[ -z "$parent" ]]; then
       printf '%*s└── %s (origin)\n' "$((depth * 4))" "" "$current"

@@ -111,7 +111,7 @@ _search_keyword() {
   # Find all .txt chunk files
   local chunk_files
   chunk_files="$(ragdag_mktemp_dir)/chunk_files.txt"
-  find "$search_path" -name '*.txt' -type f ! -name '_*' > "$chunk_files" 2>/dev/null
+  find "$search_path" -name '*.txt' -type f > "$chunk_files" 2>/dev/null
 
   while IFS= read -r chunk_file; do
     [[ -f "$chunk_file" ]] || continue
@@ -142,6 +142,19 @@ _search_keyword() {
       # TF-IDF-like score: match_count / sqrt(content_length)
       # Use integer math: score = match_count * 10000 / content_len
       local score=$(( match_count * 10000 / content_len ))
+      # Boost synthesized nodes (_ prefix)
+      local basename
+      basename="$(basename "$chunk_file")"
+      if [[ "$basename" == _* ]]; then
+        local synth_boost
+        synth_boost="$(ragdag_config_get_from "${store_dir}/.config" synthesis.synthesis_boost 12)"
+        # Integer boost: multiply by boost/10 (12 = 1.2x)
+        score=$(( score * synth_boost / 10 ))
+        # Reduce boost if stale
+        if grep -q "stale: true" "$chunk_file" 2>/dev/null; then
+          score=$(( score / 2 ))
+        fi
+      fi
       local rel_path="${chunk_file#"${store_dir}/"}"
       printf '%d\t%s\n' "$score" "$rel_path" >> "$results_file"
     fi
