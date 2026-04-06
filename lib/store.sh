@@ -24,10 +24,12 @@ ragdag_store() {
     # Re-ingestion: atomic swap via temp rename
     local tmp_target="${target_dir}.new.$$"
     mv "$staging_dir" "$tmp_target"
-    # Remove old chunks (only .txt files) then move new ones in
+    # Remove old raw chunks (preserve _ synthesis nodes) then move new ones in
     local old_chunk
     for old_chunk in "$target_dir"/*.txt; do
-      [[ -f "$old_chunk" ]] && rm "$old_chunk"
+      [[ -f "$old_chunk" ]] || continue
+      [[ "$(basename "$old_chunk")" == _* ]] && continue
+      rm "$old_chunk"
     done
     mv "$tmp_target"/*.txt "$target_dir"/ 2>/dev/null || true
     rmdir "$tmp_target" 2>/dev/null || true

@@ -168,6 +168,13 @@ ragdag_add() {
       fi
     fi
 
+    # Synthesis (if enabled and Python available)
+    local synthesis_enabled
+    synthesis_enabled="$(ragdag_config_get_from "$config_file" synthesis.enabled false)"
+    if [[ "$synthesis_enabled" == "true" ]] && ragdag_has python3; then
+      _ragdag_synthesize "$store_dir" "$doc_rel_path" "$file_domain"
+    fi
+
     # Count chunks
     local chunk_count=0
     for f in "${store_dir}/${doc_rel_path}"/*.txt; do
@@ -226,4 +233,27 @@ _ragdag_embed_chunks() {
     --dimensions "$dimensions" \
     --doc-prefix "$doc_rel_path" \
     2>/dev/null || ragdag_warn "Embedding failed for $doc_rel_path"
+}
+
+# Run ingest-time synthesis via Python bridge
+_ragdag_synthesize() {
+  local store_dir="$1"
+  local doc_rel_path="$2"
+  local domain="$3"
+
+  local synth_script="${RAGDAG_DIR}/engines/synthesis_cli.py"
+
+  if [[ ! -f "$synth_script" ]]; then
+    ragdag_debug "Synthesis script not found, skipping"
+    return 0
+  fi
+
+  local args=(
+    ingest
+    --store-dir "$store_dir"
+    --doc-rel-path "$doc_rel_path"
+  )
+  [[ -n "$domain" ]] && args+=(--domain "$domain")
+
+  python3 "$synth_script" "${args[@]}" 2>/dev/null || ragdag_warn "Synthesis failed for $doc_rel_path"
 }

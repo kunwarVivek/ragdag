@@ -30,6 +30,13 @@ vector_weight = 0.7
 auto_relate = false
 relate_threshold = 0.8
 record_queries = false
+
+[synthesis]
+enabled = false
+on_ingest = summary,entities
+on_query = off
+on_relate = clusters
+synthesis_boost = 1.2
 CONF
 }
 
