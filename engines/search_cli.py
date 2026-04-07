@@ -61,6 +61,7 @@ def cmd_search(args):
     mode = args.mode
     top_k = args.top
     domain = args.domain or ""
+    explain = getattr(args, 'explain', False)
 
     # Embed the query
     engine = get_engine(store_dir)
@@ -73,97 +74,79 @@ def cmd_search(args):
             domain=domain,
             top_k=top_k,
         )
+        explain_data = {p: {"vector": s} for p, s in results} if explain else {}
     elif mode == "hybrid":
-        # Keyword pre-filter: use grep to find candidate chunks
-        kw_weight = float(args.keyword_weight)
-        vec_weight = float(args.vector_weight)
+        from .bm25 import bm25_search
+        from .rrf import reciprocal_rank_fusion
 
-        kw_results = _keyword_search(store_dir, query, domain)
-        candidate_paths = [path for path, _ in kw_results] if kw_results else None
+        config = _read_config(store_dir)
 
+        # Phase 1: BM25 keyword search
+        bm25_results = bm25_search(store_dir, query, domain, top_k=top_k * 3)
+
+        # Phase 2: Vector search (over-fetch for fusion)
+        candidate_paths = [path for path, _ in bm25_results] if bm25_results else None
         vec_results = search_vectors(
             query_embedding=query_vec,
             store_dir=store_dir,
             domain=domain,
-            top_k=top_k * 3,  # over-fetch for fusion
+            top_k=top_k * 3,
             candidate_paths=candidate_paths,
         )
 
-        # Score fusion
-        kw_scores = {path: score for path, score in kw_results} if kw_results else {}
+        # Phase 3: RRF fusion
+        results = reciprocal_rank_fusion(
+            [bm25_results, vec_results],
+            k=60,
+            top_k=top_k,
+        )
 
-        # Normalize keyword scores
-        max_kw = max(kw_scores.values()) if kw_scores else 1.0
-        if max_kw > 0:
-            kw_scores = {p: s / max_kw for p, s in kw_scores.items()}
+        # Build explain data before reranking
+        explain_data = {}
+        if explain:
+            bm25_map = {p: s for p, s in bm25_results}
+            vec_map = {p: s for p, s in vec_results}
+            for path, rrf_score in results:
+                explain_data[path] = {
+                    "bm25": round(bm25_map.get(path, 0.0), 6),
+                    "vector": round(vec_map.get(path, 0.0), 6),
+                    "rrf": round(rrf_score, 6),
+                }
 
-        # Normalize vector scores
-        max_vec = max(s for _, s in vec_results) if vec_results else 1.0
-        if max_vec > 0:
-            vec_scores = {p: s / max_vec for p, s in vec_results}
-        else:
-            vec_scores = {}
-
-        # Combine all paths
-        all_paths = set(kw_scores.keys()) | set(vec_scores.keys())
-        fused = []
-        for path in all_paths:
-            ks = kw_scores.get(path, 0.0)
-            vs = vec_scores.get(path, 0.0)
-            score = kw_weight * ks + vec_weight * vs
-            fused.append((path, score))
-
-        fused.sort(key=lambda x: x[1], reverse=True)
-        results = fused[:top_k]
+        # Phase 4: Optional reranking
+        rerank_enabled = config.get("search.rerank", "false") == "true" or getattr(args, 'rerank', False)
+        if rerank_enabled and results:
+            try:
+                from .reranker import rerank
+                store = Path(store_dir)
+                candidates = []
+                for path, score in results:
+                    full_path = store / path
+                    content = full_path.read_text(encoding="utf-8") if full_path.exists() else ""
+                    candidates.append((path, score, content))
+                rerank_model = config.get(
+                    "search.rerank_model", "cross-encoder/ms-marco-MiniLM-L-6-v2"
+                )
+                reranked = rerank(query, candidates, model_name=rerank_model, top_k=top_k)
+                if explain:
+                    for path, blended_score in reranked:
+                        if path in explain_data:
+                            explain_data[path]["reranker"] = round(blended_score, 6)
+                results = reranked
+            except Exception:
+                pass  # graceful degradation
     else:
         print(f"Unknown search mode: {mode}", file=sys.stderr)
         sys.exit(1)
 
     # Output
     if args.json:
-        _output_json(results, store_dir)
+        _output_json(results, store_dir, explain_data if explain else None)
     else:
-        _output_human(results, store_dir)
+        _output_human(results, store_dir, explain_data if explain else None)
 
 
-def _keyword_search(store_dir: str, query: str, domain: str) -> list:
-    """Simple keyword search using Python (fallback from bash)."""
-    import re
-
-    store = Path(store_dir)
-    search_path = store / domain if domain else store
-
-    words = query.lower().split()
-    results = []
-
-    for txt_file in search_path.rglob("*.txt"):
-        if txt_file.name.startswith("_"):
-            continue
-        try:
-            content = txt_file.read_text(encoding="utf-8").lower()
-        except Exception:
-            continue
-
-        content_len = len(content)
-        if content_len == 0:
-            continue
-
-        match_count = 0
-        for word in words:
-            if len(word) < 2:
-                continue
-            match_count += content.count(word)
-
-        if match_count > 0:
-            score = match_count / content_len
-            rel_path = str(txt_file.relative_to(store))
-            results.append((rel_path, score))
-
-    results.sort(key=lambda x: x[1], reverse=True)
-    return results
-
-
-def _output_human(results: list, store_dir: str):
+def _output_human(results: list, store_dir: str, explain_data: dict = None):
     """Print results in human-readable format."""
     store = Path(store_dir)
     for i, (path, score) in enumerate(results, 1):
@@ -176,10 +159,13 @@ def _output_human(results: list, store_dir: str):
         print(f"{i}. [{score:.4f}] {path}")
         if preview:
             print(f"   {preview}")
-            print()
+        if explain_data and path in explain_data:
+            parts = [f"{k}={v}" for k, v in explain_data[path].items()]
+            print(f"   explain: {', '.join(parts)}")
+        print()
 
 
-def _output_json(results: list, store_dir: str):
+def _output_json(results: list, store_dir: str, explain_data: dict = None):
     """Print results as JSON."""
     store = Path(store_dir)
     output = []
@@ -192,12 +178,16 @@ def _output_json(results: list, store_dir: str):
         parts = path.split("/")
         domain_name = parts[0] if len(parts) >= 3 else ""
 
-        output.append({
+        entry = {
             "path": path,
             "score": round(score, 6),
             "domain": domain_name,
             "content": content,
-        })
+        }
+        if explain_data and path in explain_data:
+            entry["explain"] = explain_data[path]
+
+        output.append(entry)
 
     print(json.dumps(output, indent=2))
 
@@ -212,6 +202,8 @@ def main():
     parser.add_argument("--keyword-weight", type=float, default=0.3)
     parser.add_argument("--vector-weight", type=float, default=0.7)
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--explain", action="store_true")
+    parser.add_argument("--rerank", action="store_true")
 
     args = parser.parse_args()
     cmd_search(args)

@@ -16,6 +16,8 @@ ragdag_search() {
   local mode=""
   local top_k=""
   local json_output=0
+  local explain=0
+  local rerank=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -25,6 +27,8 @@ ragdag_search() {
       --hybrid)   mode="hybrid"; shift ;;
       --top)      top_k="$2"; shift 2 ;;
       --json)     json_output=1; shift ;;
+      --explain)  explain=1; shift ;;
+      --rerank)   rerank=1; shift ;;
       --debug)    shift ;;
       -*)         ragdag_error "Unknown option: $1"; return 1 ;;
       *)
@@ -205,6 +209,7 @@ _search_vector() {
   )
   [[ -n "$domain" ]] && args+=(--domain "$domain")
   [[ "$json_output" -eq 1 ]] && args+=(--json)
+  [[ "$explain" -eq 1 ]] && args+=(--explain)
 
   python3 "$search_script" "${args[@]}"
 }
@@ -240,6 +245,8 @@ _search_hybrid() {
   )
   [[ -n "$domain" ]] && args+=(--domain "$domain")
   [[ "$json_output" -eq 1 ]] && args+=(--json)
+  [[ "$explain" -eq 1 ]] && args+=(--explain)
+  [[ "$rerank" -eq 1 ]] && args+=(--rerank)
 
   python3 "$search_script" "${args[@]}"
 }

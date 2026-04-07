@@ -69,7 +69,7 @@ def search_vectors(
         # If we have candidate paths, filter to only those
         if candidate_paths is not None:
             candidate_set = set(candidate_paths)
-            indices = [i for i, (p, _, _, _) in enumerate(manifest) if p in candidate_set]
+            indices = [i for i, entry in enumerate(manifest) if entry[0] in candidate_set]
             if not indices:
                 continue
             idx_array = np.array(indices)
@@ -82,8 +82,8 @@ def search_vectors(
         # Compute similarity
         similarities = cosine_similarity(query_vec, filtered_vectors)
 
-        for i, (path, _, _, _) in enumerate(filtered_manifest):
-            all_results.append((path, float(similarities[i])))
+        for i, entry in enumerate(filtered_manifest):
+            all_results.append((entry[0], float(similarities[i])))
 
     # Sort by score descending
     all_results.sort(key=lambda x: x[1], reverse=True)

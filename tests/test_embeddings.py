@@ -227,7 +227,7 @@ class TestLoadValidation:
 
 class TestManifest:
     def test_manifest_roundtrip(self, tmp_path):
-        """load_manifest returns (path, index, offset, dims) for each entry."""
+        """load_manifest returns (path, index, offset, dims, content_hash) for each entry."""
         dims = 8
         vecs = _make_vectors(3, dims)
         paths = _make_chunk_paths(3, prefix="mf")
@@ -235,11 +235,13 @@ class TestManifest:
 
         entries = load_manifest(str(tmp_path / "manifest.tsv"))
         assert len(entries) == 3
-        for i, (p, idx, offset, d) in enumerate(entries):
-            assert p == paths[i]
-            assert idx == i
-            assert offset == HEADER_SIZE + i * dims * 4
-            assert d == dims
+        for i, entry in enumerate(entries):
+            assert entry[0] == paths[i]
+            assert entry[1] == i
+            assert entry[2] == HEADER_SIZE + i * dims * 4
+            assert entry[3] == dims
+            # content_hash is empty when chunk_texts not provided
+            assert entry[4] == ""
 
     def test_manifest_paths(self, tmp_path):
         """_read_manifest_paths returns just the chunk path strings."""
@@ -351,3 +353,106 @@ class TestAppendMode:
         assert c == 2
         expected = np.array(v2, dtype=np.float32)
         np.testing.assert_allclose(loaded, expected)
+
+
+# ---------------------------------------------------------------------------
+# Content-addressable embedding cache
+# ---------------------------------------------------------------------------
+
+class TestContentAddressableCache:
+    def test_manifest_includes_content_hash(self, tmp_path):
+        """Manifest should include content_hash column when chunk_texts provided."""
+        dims = 4
+        vecs = _make_vectors(2, dims)
+        paths = ["test/01.txt", "test/02.txt"]
+        texts = ["hello world", "goodbye world"]
+
+        write_embeddings(str(tmp_path), vecs, paths, dims, "model-ca",
+                         chunk_texts=texts)
+
+        entries = load_manifest(str(tmp_path / "manifest.tsv"))
+        assert len(entries) == 2
+        # content_hash should be non-empty
+        assert entries[0][4] != ""
+        assert entries[1][4] != ""
+        # Different texts should produce different hashes
+        assert entries[0][4] != entries[1][4]
+
+    def test_same_content_same_hash(self, tmp_path):
+        """Identical text should produce identical content hash."""
+        dims = 4
+        vecs = _make_vectors(2, dims)
+        paths = ["test/01.txt", "test/02.txt"]
+        texts = ["identical content", "identical content"]
+
+        write_embeddings(str(tmp_path), vecs, paths, dims, "model-ca",
+                         chunk_texts=texts)
+
+        entries = load_manifest(str(tmp_path / "manifest.tsv"))
+        assert entries[0][4] == entries[1][4]
+
+    def test_skip_reembedding_unchanged_content(self, tmp_path):
+        """When chunk text hasn't changed, vector should be reused from cache."""
+        dims = 4
+        original_vec = [[0.1, 0.2, 0.3, 0.4]]
+
+        # First write
+        write_embeddings(str(tmp_path), original_vec, ["test/01.txt"],
+                         dims, "model-ca", chunk_texts=["hello world"])
+
+        # Second write: same content, different path, different vector
+        new_vec = [[0.9, 0.9, 0.9, 0.9]]
+        write_embeddings(str(tmp_path), new_vec, ["test/02.txt"],
+                         dims, "model-ca", append=True,
+                         chunk_texts=["hello world"])
+
+        loaded, _, c, _ = load_embeddings(str(tmp_path / "embeddings.bin"))
+        assert c == 2
+
+        # The second entry should reuse the original vector, not the new one
+        np.testing.assert_array_almost_equal(loaded[1], original_vec[0])
+
+    def test_new_content_uses_new_vector(self, tmp_path):
+        """When chunk text is different, the new vector should be used."""
+        dims = 4
+        original_vec = [[0.1, 0.2, 0.3, 0.4]]
+
+        write_embeddings(str(tmp_path), original_vec, ["test/01.txt"],
+                         dims, "model-ca", chunk_texts=["hello world"])
+
+        new_vec = [[0.9, 0.9, 0.9, 0.9]]
+        write_embeddings(str(tmp_path), new_vec, ["test/02.txt"],
+                         dims, "model-ca", append=True,
+                         chunk_texts=["different content"])
+
+        loaded, _, c, _ = load_embeddings(str(tmp_path / "embeddings.bin"))
+        assert c == 2
+        # The second entry should use the new vector
+        np.testing.assert_array_almost_equal(loaded[1], new_vec[0])
+
+    def test_no_chunk_texts_backward_compatible(self, tmp_path):
+        """Without chunk_texts, manifest has empty hashes (backward compatible)."""
+        dims = 4
+        vecs = _make_vectors(2, dims)
+        paths = ["test/01.txt", "test/02.txt"]
+
+        write_embeddings(str(tmp_path), vecs, paths, dims, "model-ca")
+
+        entries = load_manifest(str(tmp_path / "manifest.tsv"))
+        assert len(entries) == 2
+        # content_hash should be empty when not provided
+        assert entries[0][4] == ""
+        assert entries[1][4] == ""
+
+    def test_old_manifest_without_hash_column(self, tmp_path):
+        """load_manifest should handle old manifests without content_hash column."""
+        mf = tmp_path / "manifest.tsv"
+        mf.write_text(
+            "# relative_chunk_path\tindex\tbyte_offset\tdimensions\n"
+            "path/a.md\t0\t32\t8\n"
+            "path/b.md\t1\t64\t8\n"
+        )
+        entries = load_manifest(str(mf))
+        assert len(entries) == 2
+        assert entries[0][4] == ""  # empty hash for old format
+        assert entries[1][4] == ""

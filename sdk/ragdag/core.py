@@ -15,6 +15,7 @@ class SearchResult:
     score: float
     content: str = ""
     domain: str = ""
+    explain: Optional[dict] = None
 
 
 @dataclass
@@ -113,7 +114,9 @@ class RagDag:
                 "default_mode = hybrid\n"
                 "top_k = 10\n"
                 "keyword_weight = 0.3\n"
-                "vector_weight = 0.7\n\n"
+                "vector_weight = 0.7\n"
+                "rerank = false\n"
+                "rerank_model = cross-encoder/ms-marco-MiniLM-L-6-v2\n\n"
                 "[edges]\n"
                 "auto_relate = false\n"
                 "relate_threshold = 0.8\n"
@@ -820,24 +823,54 @@ class RagDag:
         mode: str = "hybrid",
         domain: Optional[str] = None,
         top: int = 10,
+        explain: bool = False,
     ) -> List[SearchResult]:
         """Search the corpus."""
         if mode == "keyword":
-            return self._keyword_search(query, domain, top)
+            return self._keyword_search(query, domain, top, explain=explain)
 
         try:
-            return self._python_search(query, mode, domain, top)
+            return self._python_search(query, mode, domain, top, explain=explain)
         except Exception:
-            return self._keyword_search(query, domain, top)
+            return self._keyword_search(query, domain, top, explain=explain)
 
     def _synthesis_boost(self) -> float:
         """Get the synthesis boost factor from config."""
         return float(self._read_config("synthesis.synthesis_boost", "1.2"))
 
     def _keyword_search(
+        self, query: str, domain: Optional[str], top: int,
+        explain: bool = False,
+    ) -> List[SearchResult]:
+        """BM25 keyword search over flat files."""
+        try:
+            sys.path.insert(0, str(self._ragdag_dir))
+            from engines.bm25 import bm25_search
+
+            bm25_results = bm25_search(
+                str(self._store), query, domain or "", top,
+                synthesis_boost=self._synthesis_boost(),
+            )
+        except ImportError:
+            return self._keyword_search_legacy(query, domain, top)
+
+        results = []
+        for path, score in bm25_results:
+            full_path = self._store / path
+            content = full_path.read_text(encoding="utf-8") if full_path.exists() else ""
+            parts = path.split("/")
+            domain_name = parts[0] if len(parts) >= 3 else ""
+            explain_data = {"bm25": round(score, 6)} if explain else None
+            results.append(SearchResult(
+                path=path, score=score, content=content,
+                domain=domain_name, explain=explain_data,
+            ))
+        return results
+
+    def _keyword_search_legacy(
         self, query: str, domain: Optional[str], top: int
     ) -> List[SearchResult]:
-        """Pure Python keyword search."""
+        """Legacy pure Python keyword search (fallback if engines not available)."""
         search_path = self._store / domain if domain else self._store
         query_lower = query.lower()
         words = [w for w in query_lower.split() if len(w) >= 2]
@@ -845,7 +878,6 @@ class RagDag:
 
         results = []
         for txt_file in search_path.rglob("*.txt"):
-            # Skip hidden/metadata files but include _ synthesis nodes
             if txt_file.name.startswith("."):
                 continue
             try:
@@ -853,7 +885,6 @@ class RagDag:
             except Exception:
                 continue
 
-            # For synthesis nodes, search only the body (after frontmatter)
             is_synth = txt_file.name.startswith("_")
             search_content = content
             if is_synth and content.startswith("---\n"):
@@ -870,7 +901,6 @@ class RagDag:
 
             if match_count > 0:
                 score = match_count / content_len
-                # Boost synthesized nodes; reduce boost for stale ones
                 if is_synth:
                     if "stale: true" in content:
                         score *= boost * 0.5
@@ -888,7 +918,8 @@ class RagDag:
         return results[:top]
 
     def _python_search(
-        self, query: str, mode: str, domain: Optional[str], top: int
+        self, query: str, mode: str, domain: Optional[str], top: int,
+        explain: bool = False,
     ) -> List[SearchResult]:
         """Vector/hybrid search using Python engines."""
         sys.path.insert(0, str(self._ragdag_dir))
@@ -896,7 +927,7 @@ class RagDag:
 
         provider = self._read_config("embedding.provider", "none")
         if provider == "none":
-            return self._keyword_search(query, domain, top)
+            return self._keyword_search(query, domain, top, explain=explain)
 
         model = self._read_config("embedding.model", "text-embedding-3-small")
         dims = int(self._read_config("embedding.dimensions", "1536"))
@@ -908,58 +939,79 @@ class RagDag:
             from engines.local_engine import LocalEngine
             engine = LocalEngine(model=model, dims=dims)
         else:
-            return self._keyword_search(query, domain, top)
+            return self._keyword_search(query, domain, top, explain=explain)
 
         query_vec = engine.embed([query])[0]
 
         if mode == "hybrid":
-            # Hybrid: keyword pre-filter + vector + score fusion
-            kw_results = self._keyword_search(query, domain, top * 3)
-            kw_scores = {r.path: r.score for r in kw_results}
-            candidates = [r.path for r in kw_results]
+            from engines.bm25 import bm25_search
+            from engines.rrf import reciprocal_rank_fusion
 
+            # Phase 1: BM25 keyword search
+            bm25_results = bm25_search(
+                str(self._store), query, domain or "", top * 3,
+                synthesis_boost=self._synthesis_boost(),
+            )
+
+            # Phase 2: Vector search
+            candidate_paths = [p for p, _ in bm25_results] if bm25_results else None
             vec_results = search_vectors(
                 query_embedding=query_vec,
                 store_dir=str(self._store),
                 domain=domain or "",
-                top_k=top * 2,
-                candidate_paths=candidates,
+                top_k=top * 3,
+                candidate_paths=candidate_paths,
             )
 
-            # Score fusion with configurable weights
-            kw_weight = float(self._read_config("search.keyword_weight", "0.3"))
-            vec_weight = float(self._read_config("search.vector_weight", "0.7"))
+            # Phase 3: RRF fusion
+            fused = reciprocal_rank_fusion(
+                [bm25_results, vec_results], k=60, top_k=top
+            )
 
-            # Normalize scores to [0,1]
-            max_kw = max(kw_scores.values()) if kw_scores else 1.0
-            max_vec = max(s for _, s in vec_results) if vec_results else 1.0
+            # Build explain data
+            explain_map = {}
+            if explain:
+                bm25_map = {p: s for p, s in bm25_results}
+                vec_map = {p: s for p, s in vec_results}
+                for path, rrf_score in fused:
+                    explain_map[path] = {
+                        "bm25": round(bm25_map.get(path, 0.0), 6),
+                        "vector": round(vec_map.get(path, 0.0), 6),
+                        "rrf": round(rrf_score, 6),
+                    }
 
-            boost = self._synthesis_boost()
-            fused = []
-            for path, vec_score in vec_results:
-                ks = (kw_scores.get(path, 0.0) / max_kw) if max_kw > 1e-10 else 0.0
-                vs = (vec_score / max_vec) if max_vec > 1e-10 else 0.0
-                final_score = kw_weight * ks + vec_weight * vs
-                # Boost synthesized nodes
-                basename = path.rsplit("/", 1)[-1] if "/" in path else path
-                if basename.startswith("_"):
-                    node_path = self._store / path
-                    if node_path.exists() and "stale: true" in node_path.read_text(encoding="utf-8")[:200]:
-                        final_score *= boost * 0.5
-                    else:
-                        final_score *= boost
-                fused.append((path, final_score))
+            # Phase 4: Optional reranking
+            rerank_enabled = self._read_config("search.rerank", "false") == "true"
+            if rerank_enabled and fused:
+                try:
+                    from engines.reranker import rerank as do_rerank
+                    candidates = []
+                    for path, score in fused:
+                        fp = self._store / path
+                        content = fp.read_text(encoding="utf-8") if fp.exists() else ""
+                        candidates.append((path, score, content))
+                    reranked = do_rerank(query, candidates, top_k=top)
+                    if explain:
+                        for path, blended in reranked:
+                            if path in explain_map:
+                                explain_map[path]["reranker"] = round(blended, 6)
+                    fused = reranked
+                except Exception:
+                    pass
 
-            fused.sort(key=lambda x: x[1], reverse=True)
-            vec_results = fused[:top]
+            final_results = fused
         else:
             # Pure vector search
-            vec_results = search_vectors(
+            final_results = search_vectors(
                 query_embedding=query_vec,
                 store_dir=str(self._store),
                 domain=domain or "",
                 top_k=top,
             )
+            explain_map = {}
+            if explain:
+                for path, score in final_results:
+                    explain_map[path] = {"vector": round(score, 6)}
 
         return [
             SearchResult(
@@ -967,8 +1019,9 @@ class RagDag:
                 score=score,
                 content=(self._store / path).read_text(encoding="utf-8") if (self._store / path).exists() else "",
                 domain=path.split("/")[0] if len(path.split("/")) >= 3 else "",
+                explain=explain_map.get(path) if explain else None,
             )
-            for path, score in vec_results
+            for path, score in final_results
         ]
 
     # ------------------------------------------------------------------
