@@ -289,3 +289,65 @@ class TestContentCacheIntegration:
             assert second_embed_count == first_embed_count, \
                 f"embed() called {second_embed_count - first_embed_count} extra times on re-add of identical content"
             assert result2["skipped"] >= 1, "Second add should report file as skipped"
+
+
+class TestIndexBuildOnIngest:
+    """Tests that indexes are built/updated during ingest."""
+
+    def test_add_builds_bm25_index(self, tmp_path):
+        """After dag.add(), _bm25_index.json should exist."""
+        dag = ragdag.init(str(tmp_path))
+        doc = tmp_path / "test.md"
+        doc.write_text("# Test\n\nSome searchable content here.\n")
+        dag.add(str(doc))
+
+        assert (tmp_path / ".ragdag" / "_bm25_index.json").exists()
+
+    def test_add_builds_edge_index(self, tmp_path):
+        """After dag.add(), _edge_index.json should exist."""
+        dag = ragdag.init(str(tmp_path))
+        doc = tmp_path / "test.md"
+        doc.write_text("# Test\n\nSome content.\n")
+        dag.add(str(doc))
+
+        assert (tmp_path / ".ragdag" / "_edge_index.json").exists()
+
+    def test_search_uses_index_after_add(self, tmp_path):
+        """Search after add should use the BM25 index."""
+        dag = ragdag.init(str(tmp_path))
+        doc = tmp_path / "test.md"
+        doc.write_text("# Test\n\nUnique searchable keyword xylophone content\n")
+        dag.add(str(doc))
+
+        results = dag.search("xylophone", mode="keyword")
+        assert len(results) >= 1
+        assert "xylophone" in results[0].content.lower()
+
+    def test_reindex_rebuilds_both_indexes(self, tmp_path):
+        """reindex('all') should rebuild both indexes."""
+        dag = ragdag.init(str(tmp_path))
+        doc = tmp_path / "test.md"
+        doc.write_text("# Test\n\nReindex content.\n")
+        dag.add(str(doc))
+
+        # Delete indexes
+        (tmp_path / ".ragdag" / "_bm25_index.json").unlink()
+        (tmp_path / ".ragdag" / "_edge_index.json").unlink()
+
+        dag.reindex("all")
+
+        assert (tmp_path / ".ragdag" / "_bm25_index.json").exists()
+        assert (tmp_path / ".ragdag" / "_edge_index.json").exists()
+
+    def test_add_multiple_files_indexes_all(self, tmp_path):
+        """Adding multiple files should index all of them."""
+        import json
+
+        dag = ragdag.init(str(tmp_path))
+        for i in range(3):
+            doc = tmp_path / f"doc{i}.md"
+            doc.write_text(f"# Doc {i}\n\nContent for document {i}.\n")
+            dag.add(str(doc))
+
+        idx = json.loads((tmp_path / ".ragdag" / "_bm25_index.json").read_text())
+        assert idx["n"] >= 3  # at least 3 docs indexed

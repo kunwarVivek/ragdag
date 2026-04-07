@@ -38,6 +38,17 @@ def write_embeddings(
     If chunk_texts is provided, content hashes are stored in the manifest
     and used to skip re-embedding identical content (content-addressable cache).
     """
+    # Fast path: append-only when adding new paths (no replacements)
+    if append and chunk_paths:
+        try:
+            from .embeddings_v2 import needs_rewrite, append_embeddings
+            if not needs_rewrite(output_dir, chunk_paths):
+                append_embeddings(output_dir, vectors, chunk_paths, dimensions,
+                                  model_name_str, chunk_texts=chunk_texts)
+                return
+        except ImportError:
+            pass
+
     out = Path(output_dir)
     bin_path = out / "embeddings.bin"
     manifest_path = out / "manifest.tsv"

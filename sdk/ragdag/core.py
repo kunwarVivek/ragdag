@@ -240,8 +240,29 @@ class RagDag:
             if self._read_config("synthesis.enabled", "false") == "true":
                 self._synthesize_on_ingest(target_dir, rel_path, file_domain)
 
+            # Update BM25 index incrementally
+            try:
+                sys.path.insert(0, str(self._ragdag_dir))
+                from engines.bm25_index import update_index
+                chunk_paths = [
+                    str((target_dir / f"{i:02d}.txt").relative_to(self._store))
+                    for i in range(1, len(chunks) + 1)
+                ]
+                update_index(str(self._store), chunk_paths)
+            except (ImportError, Exception):
+                pass
+
             total_files += 1
             total_chunks += len(chunks)
+
+        # Build/rebuild edge index after all files processed
+        if total_files > 0:
+            try:
+                sys.path.insert(0, str(self._ragdag_dir))
+                from engines.edge_index import build_edge_index
+                build_edge_index(str(self._store))
+            except (ImportError, Exception):
+                pass
 
         return {"files": total_files, "chunks": total_chunks, "skipped": total_skipped}
 
@@ -1058,7 +1079,41 @@ class RagDag:
         edges_file = self._edges_path()
         seen_paths = {r.path for r in results}
         expanded = []
-        if edges_file.exists():
+        expansion_types = ("related_to", "references", "derived_from")
+
+        # Try fast path via edge index (only if fresh)
+        use_index = False
+        try:
+            sys.path.insert(0, str(self._ragdag_dir))
+            from engines.edge_index import load_edge_index, lookup_edges
+            if self._edge_index_is_fresh() and load_edge_index(str(self._store)) is not None:
+                use_index = True
+        except ImportError:
+            pass
+
+        if use_index:
+            for r in results[:5]:
+                node_edges = lookup_edges(str(self._store), r.path)
+                if not node_edges:
+                    continue
+                for e in node_edges:
+                    if e["direction"] == "outgoing" and e["edge_type"] in expansion_types:
+                        target = e["node"]
+                        if target not in seen_paths:
+                            target_file = self._store / target
+                            if target_file.exists():
+                                content = target_file.read_text(encoding="utf-8")
+                                if content.startswith("---\n"):
+                                    fm_end = content.find("\n---\n", 4)
+                                    if fm_end != -1:
+                                        content = content[fm_end + 5:]
+                                expanded.append(SearchResult(
+                                    path=target, score=r.score * 0.8,
+                                    content=content,
+                                    domain=target.split("/")[0] if len(target.split("/")) >= 3 else "",
+                                ))
+                                seen_paths.add(target)
+        elif edges_file.exists():
             edges_text = edges_file.read_text()
             for r in results[:5]:  # Expand top 5 results
                 for line in edges_text.splitlines():
@@ -1069,7 +1124,7 @@ class RagDag:
                         continue
                     source, target, etype = parts[0], parts[1], parts[2]
                     # Follow related_to, references, and derived_from edges
-                    if source == r.path and etype in ("related_to", "references", "derived_from"):
+                    if source == r.path and etype in expansion_types:
                         if target not in seen_paths:
                             target_file = self._store / target
                             if target_file.exists():
@@ -1214,6 +1269,21 @@ class RagDag:
 
     def neighbors(self, node_path: str) -> List[dict]:
         """Get connected nodes."""
+        # Fast path: use edge index (only if index is up to date)
+        try:
+            sys.path.insert(0, str(self._ragdag_dir))
+            from engines.edge_index import lookup_edges
+            idx_path = self._store / "_edge_index.json"
+            edges_file = self._edges_path()
+            # Only use index if it's at least as new as .edges
+            if idx_path.exists() and edges_file.exists() and idx_path.stat().st_mtime >= edges_file.stat().st_mtime:
+                result = lookup_edges(str(self._store), node_path)
+                if result is not None:
+                    return result
+        except (ImportError, OSError):
+            pass
+
+        # Slow path: scan .edges file
         edges_file = self._edges_path()
         if not edges_file.exists():
             return []
@@ -1240,31 +1310,62 @@ class RagDag:
                 })
         return results
 
+    def _edge_index_is_fresh(self) -> bool:
+        """Check if edge index exists and is at least as new as .edges."""
+        try:
+            idx_path = self._store / "_edge_index.json"
+            edges_file = self._edges_path()
+            return (idx_path.exists() and edges_file.exists()
+                    and idx_path.stat().st_mtime >= edges_file.stat().st_mtime)
+        except OSError:
+            return False
+
     def trace(self, node_path: str) -> List[dict]:
         """Get provenance chain."""
+        # Try fast path via edge index (only if fresh)
+        edge_index = None
+        try:
+            sys.path.insert(0, str(self._ragdag_dir))
+            from engines.edge_index import load_edge_index
+            if self._edge_index_is_fresh() and load_edge_index(str(self._store)) is not None:
+                edge_index = True
+        except ImportError:
+            pass
+
         edges_file = self._edges_path()
-        if not edges_file.exists():
+        if not edge_index and not edges_file.exists():
             return []
 
         chain = []
         current = node_path
         visited = set()
+        provenance_types = ("chunked_from", "derived_via", "derived_from", "synthesizes")
 
         while current not in visited:
             visited.add(current)
             parent = None
 
-            for line in edges_file.read_text().splitlines():
-                if line.startswith("#") or not line.strip():
-                    continue
-                parts = line.split("\t")
-                if len(parts) < 3:
-                    continue
-                source, target, etype = parts[0], parts[1], parts[2]
-                if source == current and etype in ("chunked_from", "derived_via", "derived_from", "synthesizes"):
-                    parent = target
-                    chain.append({"node": current, "parent": target, "edge_type": etype})
-                    break
+            if edge_index:
+                from engines.edge_index import lookup_edges
+                edges = lookup_edges(str(self._store), current)
+                if edges:
+                    for e in edges:
+                        if e["direction"] == "outgoing" and e["edge_type"] in provenance_types:
+                            parent = e["node"]
+                            chain.append({"node": current, "parent": parent, "edge_type": e["edge_type"]})
+                            break
+            else:
+                for line in edges_file.read_text().splitlines():
+                    if line.startswith("#") or not line.strip():
+                        continue
+                    parts = line.split("\t")
+                    if len(parts) < 3:
+                        continue
+                    source, target, etype = parts[0], parts[1], parts[2]
+                    if source == current and etype in provenance_types:
+                        parent = target
+                        chain.append({"node": current, "parent": target, "edge_type": etype})
+                        break
 
             if parent is None:
                 chain.append({"node": current, "parent": None, "edge_type": "origin"})
@@ -1290,8 +1391,30 @@ class RagDag:
             sys.argv = old_argv
         return "Done"
 
+    def reindex(self, what: str = "all") -> None:
+        """Rebuild indexes from source data.
+
+        Args:
+            what: 'bm25', 'edges', or 'all'.
+        """
+        sys.path.insert(0, str(self._ragdag_dir))
+        if what in ("bm25", "all"):
+            from engines.bm25_index import build_index
+            build_index(str(self._store))
+        if what in ("edges", "all"):
+            from engines.edge_index import build_edge_index
+            build_edge_index(str(self._store))
+
     def link(self, source: str, target: str, edge_type: str = "references"):
         """Create a manual edge."""
         edges_file = self._edges_path()
         with open(edges_file, "a") as f:
             f.write(f"{source}\t{target}\t{edge_type}\t\n")
+
+        # Update edge index if it exists
+        try:
+            sys.path.insert(0, str(self._ragdag_dir))
+            from engines.edge_index import append_edge
+            append_edge(str(self._store), source, target, edge_type, "")
+        except (ImportError, Exception):
+            pass

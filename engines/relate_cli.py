@@ -85,28 +85,43 @@ def main():
         if count < 2:
             continue
 
-        # Compute pairwise cosine similarity
-        norms = np.linalg.norm(vectors, axis=1, keepdims=True) + 1e-10
-        normed = vectors / norms
-        sim_matrix = normed @ normed.T
-
         # Find pairs above threshold
         new_edges = []
-        for i in range(count):
-            for j in range(i + 1, count):
-                if sim_matrix[i, j] >= args.threshold:
-                    path_i = manifest[i][0]
-                    path_j = manifest[j][0]
-                    # Build adjacency for cluster detection
-                    adjacency.setdefault(path_i, []).append(path_j)
-                    adjacency.setdefault(path_j, []).append(path_i)
-                    if (path_i, path_j) not in existing_edges:
-                        new_edges.append(
-                            f"{path_i}\t{path_j}\trelated_to\tsimilarity={sim_matrix[i,j]:.4f}"
-                        )
-                        existing_edges.add((path_i, path_j))
-                        existing_edges.add((path_j, path_i))
-                        added += 1
+
+        # Use ANN for large corpora, exact for small
+        if count > 1000:
+            from .ann import find_neighbors_ann
+            ann_paths = [m[0] for m in manifest]
+            pairs = find_neighbors_ann(vectors, ann_paths, args.threshold)
+            for path_i, path_j, sim in pairs:
+                adjacency.setdefault(path_i, []).append(path_j)
+                adjacency.setdefault(path_j, []).append(path_i)
+                if (path_i, path_j) not in existing_edges:
+                    new_edges.append(f"{path_i}\t{path_j}\trelated_to\tsimilarity={sim:.4f}")
+                    existing_edges.add((path_i, path_j))
+                    existing_edges.add((path_j, path_i))
+                    added += 1
+        else:
+            # Keep existing exact pairwise for small corpora (< 1000 chunks)
+            norms = np.linalg.norm(vectors, axis=1, keepdims=True) + 1e-10
+            normed = vectors / norms
+            sim_matrix = normed @ normed.T
+
+            for i in range(count):
+                for j in range(i + 1, count):
+                    if sim_matrix[i, j] >= args.threshold:
+                        path_i = manifest[i][0]
+                        path_j = manifest[j][0]
+                        # Build adjacency for cluster detection
+                        adjacency.setdefault(path_i, []).append(path_j)
+                        adjacency.setdefault(path_j, []).append(path_i)
+                        if (path_i, path_j) not in existing_edges:
+                            new_edges.append(
+                                f"{path_i}\t{path_j}\trelated_to\tsimilarity={sim_matrix[i,j]:.4f}"
+                            )
+                            existing_edges.add((path_i, path_j))
+                            existing_edges.add((path_j, path_i))
+                            added += 1
 
         # Append to edges file
         if new_edges:

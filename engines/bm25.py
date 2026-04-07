@@ -21,6 +21,16 @@ def bm25_search(
 
     Returns list of (relative_path, score) sorted descending.
     """
+    # Fast path: use inverted index if available
+    try:
+        from .bm25_index import query_index
+        indexed_results = query_index(store_dir, query, domain, top_k, synthesis_boost, stale_penalty)
+        if indexed_results is not None:
+            return indexed_results
+    except ImportError:
+        pass
+
+    # Slow path: scan files (fallback when no index exists)
     store = Path(store_dir)
     search_path = store / domain if domain else store
 
