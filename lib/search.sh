@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# search.sh — Keyword search with TF-IDF-like scoring for ragdag
+# search.sh — Search for ragdag (BM25 keyword + vector + RRF fusion)
 
 ragdag_search() {
   local store_dir
@@ -214,7 +214,7 @@ _search_vector() {
   python3 "$search_script" "${args[@]}"
 }
 
-# Hybrid search — keyword pre-filter + vector rerank
+# Hybrid search — BM25 + vector → RRF fusion → optional cross-encoder rerank
 _search_hybrid() {
   local store_dir="$1"
   local query="$2"

@@ -39,6 +39,17 @@ bats tests/bash/test_graph.bats
 - Changes in `server/mcp.py` should include tool behavior tests in `tests/test_mcp.py`.
 - Changes in `lib/*.sh` should include bats tests under `tests/bash/`.
 
+## Search Pipeline Test Files
+
+- `tests/test_bm25.py` — BM25 keyword scoring engine (IDF, TF saturation, length normalization)
+- `tests/test_rrf.py` — Reciprocal Rank Fusion (fusion, weights, k parameter)
+- `tests/test_reranker.py` — Cross-encoder reranker (blending, graceful degradation)
+- `tests/test_explain.py` — Search explain mode (score breakdown)
+- `tests/test_pipeline_integration.py` — Integration tests (BM25+RRF pipeline, config, reranker wiring)
+- `tests/test_search_hybrid.py` — Hybrid search fallback behavior
+- `tests/test_embeddings.py` — Binary embeddings format + content-addressable cache
+- `tests/test_similarity.py` — Cosine similarity and vector search
+
 ## Quality Gate Expectations
 
 Before merging changes:

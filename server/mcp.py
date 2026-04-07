@@ -42,21 +42,27 @@ async def ragdag_search(
     mode: str = "hybrid",
     domain: Optional[str] = None,
     top: int = 10,
+    explain: bool = False,
     ctx: Context = None,
 ) -> str:
     """Search the ragdag knowledge base.
 
+    Hybrid mode uses BM25 keyword scoring + vector similarity, fused with
+    Reciprocal Rank Fusion (RRF). Optional cross-encoder reranking can be
+    enabled via search.rerank config.
+
     Args:
         query: Search query string
-        mode: Search mode — "keyword" (pure bash), "vector" (embeddings), or "hybrid" (both)
+        mode: Search mode — "keyword" (BM25), "vector" (embeddings), or "hybrid" (BM25 + vector with RRF)
         domain: Optional domain filter to narrow search scope
         top: Number of results to return (default 10)
+        explain: If true, include per-result score breakdown (bm25, vector, rrf scores)
     """
     if ctx:
         await ctx.info(f"Searching for: {query} (mode={mode}, domain={domain})")
 
     dag = _get_dag()
-    results = dag.search(query, mode=mode, domain=domain, top=top)
+    results = dag.search(query, mode=mode, domain=domain, top=top, explain=explain)
 
     if not results:
         return "No results found."
@@ -64,7 +70,11 @@ async def ragdag_search(
     parts = []
     for i, r in enumerate(results, 1):
         preview = r.content[:200].replace("\n", " ") if r.content else ""
-        parts.append(f"{i}. **{r.path}** (score: {r.score:.4f})\n   {preview}")
+        line = f"{i}. **{r.path}** (score: {r.score:.4f})\n   {preview}"
+        if explain and r.explain:
+            explain_str = ", ".join(f"{k}={v}" for k, v in r.explain.items())
+            line += f"\n   explain: {explain_str}"
+        parts.append(line)
 
     return "\n\n".join(parts)
 

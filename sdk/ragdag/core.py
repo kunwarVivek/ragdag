@@ -825,7 +825,21 @@ class RagDag:
         top: int = 10,
         explain: bool = False,
     ) -> List[SearchResult]:
-        """Search the corpus."""
+        """Search the corpus.
+
+        Args:
+            query: Search query string.
+            mode: "keyword" (BM25), "vector" (embeddings), or "hybrid" (BM25 + vector
+                  fused with Reciprocal Rank Fusion). Default: "hybrid".
+            domain: Optional domain filter.
+            top: Number of results to return.
+            explain: If True, each SearchResult.explain contains a dict with score
+                     breakdown: {"bm25": float, "vector": float, "rrf": float,
+                     "reranker": float (if enabled)}.
+
+        Returns:
+            List of SearchResult sorted by relevance score descending.
+        """
         if mode == "keyword":
             return self._keyword_search(query, domain, top, explain=explain)
 

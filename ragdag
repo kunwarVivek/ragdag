@@ -40,10 +40,13 @@ Commands:
 Options:
   --domain <name|auto>           Organize by domain
   --flat                         No domain organization
-  --keyword                      Keyword-only search
-  --vector                       Vector-only search
+  --keyword                      Keyword-only search (BM25)
+  --vector                       Vector-only search (embeddings)
+  --hybrid                       BM25 + vector with RRF fusion (default)
   --top <n>                      Number of results (default: 10)
   --json                         JSON output
+  --explain                      Show per-result score breakdown
+  --rerank                       Enable cross-encoder reranking
   --no-embed                     Skip embedding on ingest
   --no-llm                       Skip LLM on ask (show context only)
   --debug                        Enable debug output

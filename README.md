@@ -18,6 +18,17 @@ It stores everything in a local `.ragdag/` directory (chunks, edges, config, and
 - `tests/` - pytest and bats test suites
 - `docs/` - project documentation
 
+## Search Pipeline
+
+ragdag uses a multi-stage search pipeline:
+
+1. **BM25 keyword scoring** — proper term frequency saturation and inverse document frequency weighting over flat `.txt` files
+2. **Vector similarity** — cosine similarity over embedded chunks (OpenAI or local sentence-transformers)
+3. **Reciprocal Rank Fusion (RRF)** — combines keyword and vector ranked lists using rank-based fusion (k=60), robust to score distribution skew
+4. **Cross-encoder reranking** (optional) — re-scores top candidates with a cross-encoder model for higher precision. Enable with `ragdag config set search.rerank true`
+
+Use `--explain` to see per-result score breakdown (BM25, vector, RRF contributions).
+
 ## Quick Start
 
 ### CLI
@@ -26,6 +37,8 @@ It stores everything in a local `.ragdag/` directory (chunks, edges, config, and
 ./ragdag init
 ./ragdag add ./docs
 ./ragdag search "knowledge graph" --top 5
+./ragdag search "knowledge graph" --explain          # show score breakdown
+./ragdag search "knowledge graph" --rerank           # enable cross-encoder reranking
 ./ragdag ask "What does this project do?" --no-llm
 ./ragdag graph
 ```
@@ -38,6 +51,7 @@ import ragdag
 dag = ragdag.init(".")
 dag.add("./docs")
 results = dag.search("knowledge graph", mode="hybrid", top=5)
+results = dag.search("knowledge graph", explain=True)  # score breakdown in r.explain
 answer = dag.ask("What does this project do?", use_llm=False)
 ```
 

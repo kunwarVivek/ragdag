@@ -45,6 +45,7 @@ class SearchRequest(BaseModel):
     mode: Optional[str] = "hybrid"
     domain: Optional[str] = None
     top: Optional[int] = 10
+    explain: Optional[bool] = False
 
 
 class AskRequest(BaseModel):
@@ -78,11 +79,15 @@ def add_documents(req: AddRequest):
 @app.post("/search")
 def search_corpus(req: SearchRequest):
     dag = get_dag()
-    results = dag.search(req.query, mode=req.mode, domain=req.domain, top=req.top)
-    return [
-        {"path": r.path, "score": r.score, "content": r.content, "domain": r.domain}
-        for r in results
-    ]
+    results = dag.search(req.query, mode=req.mode, domain=req.domain, top=req.top,
+                         explain=req.explain)
+    output = []
+    for r in results:
+        entry = {"path": r.path, "score": r.score, "content": r.content, "domain": r.domain}
+        if req.explain and r.explain:
+            entry["explain"] = r.explain
+        output.append(entry)
+    return output
 
 
 @app.post("/ask")

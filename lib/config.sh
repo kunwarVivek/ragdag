@@ -25,6 +25,8 @@ default_mode = hybrid
 top_k = 10
 keyword_weight = 0.3
 vector_weight = 0.7
+rerank = false
+rerank_model = cross-encoder/ms-marco-MiniLM-L-6-v2
 
 [edges]
 auto_relate = false
