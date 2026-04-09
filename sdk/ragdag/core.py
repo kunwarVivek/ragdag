@@ -19,6 +19,16 @@ class SearchResult:
 
 
 @dataclass
+class ChunkMeta:
+    source: str
+    position: int
+    total: int
+    strategy: str
+    hash: str
+    heading: str = ""
+
+
+@dataclass
 class AskResult:
     answer: Optional[str]
     context: str

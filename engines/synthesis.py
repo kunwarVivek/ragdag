@@ -35,6 +35,26 @@ def write_synthesis_node(
     path.write_text(frontmatter + content, encoding="utf-8")
 
 
+def write_chunk_node(
+    path: Path,
+    content: str,
+    meta,  # ChunkMeta — duck-typed to avoid circular import
+) -> None:
+    """Write a chunk file with provenance frontmatter."""
+    frontmatter = (
+        "---\n"
+        f"type: chunk\n"
+        f"source: {meta.source}\n"
+        f"heading: {meta.heading}\n"
+        f"position: {meta.position}\n"
+        f"total: {meta.total}\n"
+        f"strategy: {meta.strategy}\n"
+        f"hash: {meta.hash}\n"
+        "---\n"
+    )
+    path.write_text(frontmatter + content, encoding="utf-8")
+
+
 def read_frontmatter(path: Path) -> Optional[Dict]:
     """Parse YAML frontmatter from a synthesis node. Returns None if not a synthesis node."""
     try:
