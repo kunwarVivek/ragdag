@@ -46,6 +46,100 @@ class GraphStats:
     edge_types: dict = field(default_factory=dict)
 
 
+@dataclass
+class QualityReport:
+    """Quality metrics for a ragdag store."""
+    total_chunks: int = 0
+    chunks_with_provenance: int = 0
+    chunks_with_embeddings: int = 0
+    chunks_in_bm25_index: int = 0
+    total_documents: int = 0
+    documents_with_edges: int = 0
+    documents_with_synthesis: int = 0
+    total_edges: int = 0
+    edge_types: dict = field(default_factory=dict)
+    synthesis_nodes: int = 0
+    stale_synthesis_nodes: int = 0
+    domains: int = 0
+
+    @property
+    def provenance_coverage(self) -> float:
+        return self.chunks_with_provenance / self.total_chunks if self.total_chunks else 0.0
+
+    @property
+    def embedding_coverage(self) -> float:
+        return self.chunks_with_embeddings / self.total_chunks if self.total_chunks else 0.0
+
+    @property
+    def bm25_coverage(self) -> float:
+        return self.chunks_in_bm25_index / self.total_chunks if self.total_chunks else 0.0
+
+    @property
+    def edge_density(self) -> float:
+        return self.total_edges / self.total_documents if self.total_documents else 0.0
+
+    @property
+    def orphan_rate(self) -> float:
+        orphans = self.total_documents - self.documents_with_edges
+        return orphans / self.total_documents if self.total_documents else 0.0
+
+    @property
+    def synthesis_coverage(self) -> float:
+        return self.documents_with_synthesis / self.total_documents if self.total_documents else 0.0
+
+    @property
+    def stale_rate(self) -> float:
+        return self.stale_synthesis_nodes / self.synthesis_nodes if self.synthesis_nodes else 0.0
+
+    @property
+    def overall_score(self) -> float:
+        """Weighted average of key metrics (0.0-1.0)."""
+        scores = [
+            self.provenance_coverage,
+            self.embedding_coverage,
+            self.bm25_coverage,
+            1.0 - self.orphan_rate,
+            self.synthesis_coverage,
+            1.0 - self.stale_rate,
+        ]
+        return sum(scores) / len(scores) if scores else 0.0
+
+    def summary(self) -> str:
+        """Human-readable quality report."""
+        lines = [
+            "ragdag Quality Report",
+            "=" * 40,
+            f"Domains:             {self.domains}",
+            f"Documents:           {self.total_documents}",
+            f"Chunks:              {self.total_chunks}",
+            f"Edges:               {self.total_edges}",
+            "",
+            "Coverage",
+            "-" * 40,
+            f"Provenance:          {self.provenance_coverage:.0%} ({self.chunks_with_provenance}/{self.total_chunks})",
+            f"Embeddings:          {self.embedding_coverage:.0%} ({self.chunks_with_embeddings}/{self.total_chunks})",
+            f"BM25 Index:          {self.bm25_coverage:.0%} ({self.chunks_in_bm25_index}/{self.total_chunks})",
+            "",
+            "Graph Health",
+            "-" * 40,
+            f"Edge Density:        {self.edge_density:.1f} edges/doc",
+            f"Orphan Rate:         {self.orphan_rate:.0%}",
+            f"Synthesis Coverage:  {self.synthesis_coverage:.0%} ({self.documents_with_synthesis}/{self.total_documents})",
+            f"Stale Nodes:         {self.stale_rate:.0%} ({self.stale_synthesis_nodes}/{self.synthesis_nodes})",
+            "",
+            "Edge Types",
+            "-" * 40,
+        ]
+        for etype, count in sorted(self.edge_types.items(), key=lambda x: -x[1]):
+            lines.append(f"  {etype}: {count}")
+        lines.extend([
+            "",
+            "=" * 40,
+            f"Overall Score:       {self.overall_score:.0%}",
+        ])
+        return "\n".join(lines)
+
+
 def _sha256(path: Path) -> str:
     """Compute SHA256 hash of a file."""
     import hashlib
@@ -1581,6 +1675,122 @@ class RagDag:
             domains=domains, documents=documents, chunks=chunks,
             edges=total_edges, edge_types=edge_types,
         )
+
+    def quality(self, domain: Optional[str] = None) -> "QualityReport":
+        """Compute quality metrics for the store."""
+        report = QualityReport()
+
+        # Collect all document dirs and chunk files
+        doc_dirs = []
+        all_chunks = []  # (relative_path, full_path)
+
+        for d in self._store.iterdir():
+            if not d.is_dir() or d.name.startswith(".") or d.name.startswith("_"):
+                continue
+            if domain and d.name != domain:
+                continue
+            # Check if this is a domain dir (has subdirectories) or a bare doc dir
+            sub_items = [s for s in d.iterdir() if not s.name.startswith(".")]
+            has_subdirs = any(s.is_dir() for s in sub_items)
+            if has_subdirs:
+                # This is a domain directory
+                report.domains += 1
+                for doc_dir in d.iterdir():
+                    if not doc_dir.is_dir():
+                        continue
+                    doc_dirs.append(doc_dir)
+                    report.total_documents += 1
+                    for txt in doc_dir.glob("*.txt"):
+                        if txt.name.startswith("_"):
+                            # Synthesis node
+                            report.synthesis_nodes += 1
+                            content = txt.read_text(encoding="utf-8")
+                            if "stale: true" in content[:200]:
+                                report.stale_synthesis_nodes += 1
+                        elif txt.name[0].isdigit():
+                            # Regular chunk
+                            rel = str(txt.relative_to(self._store))
+                            all_chunks.append((rel, txt))
+                            report.total_chunks += 1
+            else:
+                # Domain-less document directory
+                doc_dirs.append(d)
+                report.total_documents += 1
+                for txt in d.glob("*.txt"):
+                    if txt.name.startswith("_"):
+                        report.synthesis_nodes += 1
+                        content = txt.read_text(encoding="utf-8")
+                        if "stale: true" in content[:200]:
+                            report.stale_synthesis_nodes += 1
+                    elif txt.name[0].isdigit():
+                        rel = str(txt.relative_to(self._store))
+                        all_chunks.append((rel, txt))
+                        report.total_chunks += 1
+
+        # Check provenance (frontmatter with ---)
+        for rel, full in all_chunks:
+            try:
+                with open(full, "r", encoding="utf-8") as f:
+                    first_line = f.readline()
+                if first_line.startswith("---"):
+                    report.chunks_with_provenance += 1
+            except Exception:
+                pass
+
+        # Check embeddings (look at manifest files)
+        for manifest_file in self._store.rglob(".manifest"):
+            try:
+                for line in manifest_file.read_text().splitlines():
+                    parts = line.split("\t")
+                    if len(parts) >= 3:
+                        report.chunks_with_embeddings += 1
+            except Exception:
+                pass
+
+        # Check BM25 index
+        bm25_index_path = self._store / "_bm25_index.json"
+        if bm25_index_path.exists():
+            try:
+                import json
+                idx = json.loads(bm25_index_path.read_text())
+                if "doc_lengths" in idx:
+                    report.chunks_in_bm25_index = len(idx["doc_lengths"])
+            except Exception:
+                pass
+
+        # Edge analysis
+        edges_file = self._edges_path()
+        docs_with_edges = set()
+        if edges_file.exists():
+            for line in edges_file.read_text().splitlines():
+                if line.startswith("#") or not line.strip():
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 3:
+                    report.total_edges += 1
+                    etype = parts[2]
+                    report.edge_types[etype] = report.edge_types.get(etype, 0) + 1
+                    # Track which doc dirs have edges
+                    for p in (parts[0], parts[1]):
+                        doc_path = "/".join(p.split("/")[:2]) if "/" in p else p
+                        docs_with_edges.add(doc_path)
+
+        # Match doc dirs to edge entries
+        for dd in doc_dirs:
+            rel = str(dd.relative_to(self._store))
+            if rel in docs_with_edges or any(rel in de for de in docs_with_edges):
+                report.documents_with_edges += 1
+
+        # Synthesis coverage
+        for dd in doc_dirs:
+            has_synth = any(
+                f.name.startswith("_") and f.name.endswith(".txt")
+                for f in dd.iterdir() if f.is_file()
+            )
+            if has_synth:
+                report.documents_with_synthesis += 1
+
+        return report
 
     def neighbors(self, node_path: str) -> List[dict]:
         """Get connected nodes."""
