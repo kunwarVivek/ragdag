@@ -33,6 +33,8 @@ class AskResult:
     answer: Optional[str]
     context: str
     sources: List[str] = field(default_factory=list)
+    confidence: str = "unknown"
+    retrieval_attempts: int = 1
 
 
 @dataclass
@@ -126,7 +128,10 @@ class RagDag:
                 "keyword_weight = 0.3\n"
                 "vector_weight = 0.7\n"
                 "rerank = false\n"
-                "rerank_model = cross-encoder/ms-marco-MiniLM-L-6-v2\n\n"
+                "rerank_model = cross-encoder/ms-marco-MiniLM-L-6-v2\n"
+                "hyde = false\n"
+                "crag = false\n"
+                "crag_max_retries = 1\n\n"
                 "[edges]\n"
                 "auto_relate = false\n"
                 "relate_threshold = 0.8\n"
@@ -194,7 +199,9 @@ class RagDag:
             # Select chunk strategy based on file type
             ftype = self._detect_file_type(abs_path)
             config_strategy = self._read_config("general.chunk_strategy", "heading")
-            if ftype == "markdown":
+            if config_strategy == "proposition":
+                strategy = "proposition"
+            elif ftype == "markdown":
                 strategy = "heading"
             elif ftype == "code":
                 strategy = "function"
@@ -203,10 +210,11 @@ class RagDag:
             else:
                 strategy = config_strategy
 
-            # Chunk
-            chunks = self._chunk_text(text, chunk_size, chunk_overlap, strategy)
-            if not chunks:
-                chunks = [text]
+            # Chunk (with metadata)
+            chunk_tuples = self._chunk_text_with_meta(text, chunk_size, chunk_overlap, strategy)
+            if not chunk_tuples:
+                chunk_tuples = [(text, "")]
+            chunks = [t[0] for t in chunk_tuples]
 
             # Determine doc name and domain
             doc_name = _sanitize(file.stem) or "document"
@@ -230,10 +238,20 @@ class RagDag:
                 if not old.name.startswith("_"):
                     old.unlink()
 
-            # Write new chunks
-            for i, chunk_text in enumerate(chunks, 1):
+            # Write new chunks with provenance
+            total_in_doc = len(chunk_tuples)
+            for i, (chunk_text, heading) in enumerate(chunk_tuples, 1):
                 chunk_file = target_dir / f"{i:02d}.txt"
-                chunk_file.write_text(chunk_text, encoding="utf-8")
+                meta = ChunkMeta(
+                    source=str(abs_path),
+                    heading=heading,
+                    position=i,
+                    total=total_in_doc,
+                    strategy=strategy,
+                    hash=content_hash,
+                )
+                from engines.synthesis import write_chunk_node
+                write_chunk_node(chunk_file, chunk_text, meta)
 
             # Update .processed
             self._record_processed(abs_path, content_hash, file_domain)
@@ -412,6 +430,34 @@ class RagDag:
             return path.read_text(encoding="utf-8", errors="replace")
         return "\n".join(lines)
 
+    @staticmethod
+    def _strip_frontmatter(text: str) -> str:
+        """Strip YAML frontmatter from chunk or synthesis node text."""
+        if text.startswith("---\n"):
+            end = text.find("\n---\n", 4)
+            if end != -1:
+                return text[end + 5:]
+        return text
+
+    def _chunk_text_with_meta(
+        self, text: str, chunk_size: int, overlap: int, strategy: str = "heading"
+    ) -> List[tuple]:
+        """Split text into chunks, returning (text, heading) tuples."""
+        if strategy == "heading":
+            return self._chunk_heading_with_meta(text, chunk_size, overlap)
+        elif strategy == "proposition":
+            # Two-pass: heading chunks first, then decompose each
+            heading_chunks = self._chunk_heading_with_meta(text, chunk_size, overlap)
+            all_props = []
+            for chunk_text, heading in heading_chunks:
+                props = self._chunk_proposition(chunk_text, chunk_size, overlap)
+                # Inherit heading from parent chunk
+                all_props.extend([(p_text, heading) for p_text, _ in props])
+            return all_props if all_props else heading_chunks
+        else:
+            plain_chunks = self._chunk_text(text, chunk_size, overlap, strategy)
+            return [(c, "") for c in plain_chunks]
+
     def _chunk_text(
         self, text: str, chunk_size: int, overlap: int, strategy: str = "heading"
     ) -> List[str]:
@@ -465,6 +511,96 @@ class RagDag:
                 chunks.append(chunk_text)
 
         return chunks
+
+    def _chunk_heading_with_meta(
+        self, text: str, chunk_size: int, overlap: int
+    ) -> List[tuple]:
+        """Split on markdown headings, returning (text, heading) tuples."""
+        lines = text.split("\n")
+        chunks = []
+        buffer = []
+        buffer_len = 0
+        current_heading = ""
+
+        for line in lines:
+            is_header = line.startswith("#")
+
+            if is_header:
+                if buffer_len > 0:
+                    chunk_text = "\n".join(buffer)
+                    if chunk_text.strip():
+                        chunks.append((chunk_text, current_heading))
+                    if overlap > 0:
+                        buffer = [chunk_text[-overlap:], line]
+                    else:
+                        buffer = [line]
+                    buffer_len = sum(len(b) for b in buffer)
+                current_heading = line.strip()
+                if not buffer:
+                    buffer = [line]
+                    buffer_len = len(line) + 1
+                continue
+
+            buffer.append(line)
+            buffer_len += len(line) + 1
+
+            if buffer_len >= chunk_size:
+                chunk_text = "\n".join(buffer)
+                if chunk_text.strip():
+                    chunks.append((chunk_text, current_heading))
+                if overlap > 0:
+                    buffer = [chunk_text[-overlap:]]
+                else:
+                    buffer = []
+                buffer_len = sum(len(b) for b in buffer)
+
+        if buffer:
+            chunk_text = "\n".join(buffer)
+            if chunk_text.strip():
+                chunks.append((chunk_text, current_heading))
+
+        return chunks
+
+    def _chunk_proposition(
+        self, text: str, chunk_size: int, overlap: int
+    ) -> List[tuple]:
+        """Decompose text into atomic propositions via LLM, with sentence-split fallback.
+
+        Returns list of (proposition_text, heading) tuples.
+        Heading is empty string -- caller sets from parent chunk if available.
+        """
+        llm_provider = self._read_config("llm.provider", "none")
+
+        if llm_provider != "none":
+            try:
+                sys.path.insert(0, str(self._ragdag_dir))
+                from engines.llm import call_llm
+
+                llm_model = self._read_config("llm.model", "gpt-4o-mini")
+                prompt = (
+                    "Decompose this text into self-contained factual statements. "
+                    "Each statement should be understandable without context. "
+                    "Resolve pronouns and references. Return one statement per line. "
+                    "Do not number them or add bullets.\n\n"
+                    f"Text:\n{text}"
+                )
+                system_msg = "You are a text decomposition engine. Return only the propositions, one per line."
+                raw = call_llm(system_msg, prompt, llm_provider, llm_model)
+                propositions = [
+                    line.strip() for line in raw.strip().splitlines()
+                    if line.strip() and len(line.strip()) > 10
+                ]
+                if propositions:
+                    return [(p, "") for p in propositions]
+            except Exception:
+                pass  # Fall through to sentence splitting
+
+        # Fallback: regex sentence splitting
+        sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+        sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
+        if not sentences:
+            return [(text, "")]
+        return [(s, "") for s in sentences]
 
     def _chunk_paragraph(self, text: str, chunk_size: int, overlap: int) -> List[str]:
         """Split on blank lines (paragraph boundaries)."""
@@ -902,7 +1038,10 @@ class RagDag:
         results = []
         for path, score in bm25_results:
             full_path = self._store / path
-            content = full_path.read_text(encoding="utf-8") if full_path.exists() else ""
+            content = ""
+            if full_path.exists():
+                raw = full_path.read_text(encoding="utf-8")
+                content = self._strip_frontmatter(raw)
             parts = path.split("/")
             domain_name = parts[0] if len(parts) >= 3 else ""
             explain_data = {"bm25": round(score, 6)} if explain else None
@@ -962,6 +1101,54 @@ class RagDag:
         results.sort(key=lambda r: r.score, reverse=True)
         return results[:top]
 
+    def _hyde_expand(self, query: str) -> str:
+        """Expand query into a hypothetical answer for better vector matching.
+
+        Returns the original query if HyDE is disabled, LLM is unavailable,
+        or the LLM call fails.
+        """
+        hyde_enabled = self._read_config("search.hyde", "false") == "true"
+        if not hyde_enabled:
+            return query
+
+        llm_provider = self._read_config("llm.provider", "none")
+        if llm_provider == "none":
+            return query
+
+        # Check cache
+        import hashlib
+        query_hash = hashlib.sha256(query.encode()).hexdigest()[:16]
+        cache_dir = self._store / ".hyde_cache"
+        cache_file = cache_dir / f"{query_hash}.txt"
+
+        if cache_file.exists():
+            return cache_file.read_text(encoding="utf-8")
+
+        # Generate hypothetical answer
+        try:
+            sys.path.insert(0, str(self._ragdag_dir))
+            from engines.llm import call_llm
+
+            llm_model = self._read_config("llm.model", "gpt-4o-mini")
+            system_msg = (
+                "You are a document retrieval assistant. Write a short factual "
+                "passage that would answer the given question. Do not add disclaimers."
+            )
+            prompt = (
+                f"Write a short passage (3-4 sentences) that would answer "
+                f"this question:\n{query}"
+            )
+            hypothetical = call_llm(system_msg, prompt, llm_provider, llm_model)
+
+            if hypothetical and hypothetical.strip():
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                cache_file.write_text(hypothetical.strip(), encoding="utf-8")
+                return hypothetical.strip()
+        except Exception:
+            pass
+
+        return query
+
     def _python_search(
         self, query: str, mode: str, domain: Optional[str], top: int,
         explain: bool = False,
@@ -986,7 +1173,9 @@ class RagDag:
         else:
             return self._keyword_search(query, domain, top, explain=explain)
 
-        query_vec = engine.embed([query])[0]
+        # HyDE: embed hypothetical answer for vector search, keep original for BM25
+        hyde_query = self._hyde_expand(query)
+        query_vec = engine.embed([hyde_query])[0]
 
         if mode == "hybrid":
             from engines.bm25 import bm25_search
@@ -1062,12 +1251,151 @@ class RagDag:
             SearchResult(
                 path=path,
                 score=score,
-                content=(self._store / path).read_text(encoding="utf-8") if (self._store / path).exists() else "",
+                content=self._strip_frontmatter((self._store / path).read_text(encoding="utf-8")) if (self._store / path).exists() else "",
                 domain=path.split("/")[0] if len(path.split("/")) >= 3 else "",
                 explain=explain_map.get(path) if explain else None,
             )
             for path, score in final_results
         ]
+
+    # ------------------------------------------------------------------
+    # CRAG helpers
+    # ------------------------------------------------------------------
+
+    def _crag_relevance_check(self, question: str, context: str) -> tuple:
+        """Check if retrieved context is relevant to the question.
+
+        Returns (rating, gap_description).
+        """
+        sys.path.insert(0, str(self._ragdag_dir))
+        from engines.llm import call_llm
+
+        llm_provider = self._read_config("llm.provider", "none")
+        llm_model = self._read_config("llm.model", "gpt-4o-mini")
+
+        context_preview = context[:2000]
+
+        system_msg = (
+            "You are a relevance evaluator. Rate whether the provided context "
+            "can answer the question. Respond with exactly one of:\n"
+            "SUFFICIENT\n"
+            "PARTIAL: <what information is missing>\n"
+            "INSUFFICIENT\n"
+            "Nothing else."
+        )
+        user_msg = f"Question: {question}\n\nContext:\n{context_preview}"
+
+        try:
+            raw = call_llm(system_msg, user_msg, llm_provider, llm_model)
+            raw = raw.strip() if raw else "INSUFFICIENT"
+            upper = raw.upper()
+
+            if upper.startswith("SUFFICIENT"):
+                return ("sufficient", "")
+            elif upper.startswith("PARTIAL"):
+                gap = raw.split(":", 1)[1].strip() if ":" in raw else ""
+                return ("partial", gap)
+            else:
+                return ("insufficient", "")
+        except Exception:
+            return ("sufficient", "")
+
+    def _crag_reformulate(self, question: str, gap: str) -> str:
+        """Generate a reformulated search query based on identified gaps."""
+        sys.path.insert(0, str(self._ragdag_dir))
+        from engines.llm import call_llm
+
+        llm_provider = self._read_config("llm.provider", "none")
+        llm_model = self._read_config("llm.model", "gpt-4o-mini")
+
+        system_msg = "Generate a concise search query to find the missing information. Return only the query, nothing else."
+        if gap:
+            user_msg = f"Original question: {question}\nMissing information: {gap}\nSearch query:"
+        else:
+            user_msg = f"Rephrase this question as a search query with key terms:\n{question}"
+
+        try:
+            result = call_llm(system_msg, user_msg, llm_provider, llm_model)
+            return result.strip() if result else question
+        except Exception:
+            return question
+
+    def _expand_via_graph(self, results: list, seen_paths: set) -> list:
+        """Pull in related chunks via graph edges."""
+        edges_file = self._edges_path()
+        expanded = []
+        expansion_types = ("related_to", "references", "derived_from")
+
+        use_index = False
+        try:
+            sys.path.insert(0, str(self._ragdag_dir))
+            from engines.edge_index import load_edge_index, lookup_edges
+            if self._edge_index_is_fresh() and load_edge_index(str(self._store)) is not None:
+                use_index = True
+        except ImportError:
+            pass
+
+        if use_index:
+            for r in results:
+                node_edges = lookup_edges(str(self._store), r.path)
+                if not node_edges:
+                    continue
+                for e in node_edges:
+                    if e["direction"] == "outgoing" and e["edge_type"] in expansion_types:
+                        target = e["node"]
+                        if target not in seen_paths:
+                            target_file = self._store / target
+                            if target_file.exists():
+                                content = target_file.read_text(encoding="utf-8")
+                                content = self._strip_frontmatter(content)
+                                expanded.append(SearchResult(
+                                    path=target, score=r.score * 0.8,
+                                    content=content,
+                                    domain=target.split("/")[0] if len(target.split("/")) >= 3 else "",
+                                ))
+                                seen_paths.add(target)
+        elif edges_file.exists():
+            edges_text = edges_file.read_text()
+            for r in results:
+                for line in edges_text.splitlines():
+                    if line.startswith("#") or not line.strip():
+                        continue
+                    parts = line.split("\t")
+                    if len(parts) < 3:
+                        continue
+                    source, target, etype = parts[0], parts[1], parts[2]
+                    if source == r.path and etype in expansion_types:
+                        if target not in seen_paths:
+                            target_file = self._store / target
+                            if target_file.exists():
+                                content = target_file.read_text(encoding="utf-8")
+                                content = self._strip_frontmatter(content)
+                                expanded.append(SearchResult(
+                                    path=target, score=r.score * 0.8,
+                                    content=content,
+                                    domain=target.split("/")[0] if len(target.split("/")) >= 3 else "",
+                                ))
+                                seen_paths.add(target)
+        return expanded
+
+    def _build_context(self, results: list) -> tuple:
+        """Assemble context string from search results, respecting token limits."""
+        max_context = int(self._read_config("llm.max_context", "8000"))
+        context_parts = []
+        sources = []
+        tokens_used = 0
+
+        for r in results:
+            chunk_tokens = int(len(r.content.split()) * 1.3)
+            if tokens_used + chunk_tokens > max_context:
+                break
+            context_parts.append(
+                f"--- Source: {r.path} (score: {r.score:.4f}) ---\n{r.content}"
+            )
+            sources.append(r.path)
+            tokens_used += chunk_tokens
+
+        return "\n\n".join(context_parts), sources
 
     # ------------------------------------------------------------------
     # Ask (RAG)
@@ -1079,103 +1407,77 @@ class RagDag:
         domain: Optional[str] = None,
         use_llm: bool = True,
     ) -> AskResult:
-        """Ask a question using RAG."""
-        results = self.search(question, mode="hybrid", domain=domain, top=10)
+        """Ask a question using RAG, with optional CRAG validation loop."""
+        crag_enabled = (
+            self._read_config("search.crag", "false") == "true"
+            and use_llm
+            and self._read_config("llm.provider", "none") != "none"
+        )
+        max_retries = int(self._read_config("search.crag_max_retries", "1"))
+        current_query = question
+        all_results: list = []
+        seen_paths: set = set()
+        attempts = 0
+        confidence = "unknown"
+        context = ""
+        sources: List[str] = []
 
-        if not results:
-            return AskResult(answer=None, context="", sources=[])
+        for attempt in range(1 + max_retries):
+            attempts = attempt + 1
 
-        # Graph expansion: pull in related/referenced chunks
-        edges_file = self._edges_path()
-        seen_paths = {r.path for r in results}
-        expanded = []
-        expansion_types = ("related_to", "references", "derived_from")
+            # Search
+            results = self.search(current_query, mode="hybrid", domain=domain, top=10)
 
-        # Try fast path via edge index (only if fresh)
-        use_index = False
-        try:
-            sys.path.insert(0, str(self._ragdag_dir))
-            from engines.edge_index import load_edge_index, lookup_edges
-            if self._edge_index_is_fresh() and load_edge_index(str(self._store)) is not None:
-                use_index = True
-        except ImportError:
-            pass
+            # Merge with previous results (dedup by path)
+            for r in results:
+                if r.path not in seen_paths:
+                    all_results.append(r)
+                    seen_paths.add(r.path)
 
-        if use_index:
-            for r in results[:5]:
-                node_edges = lookup_edges(str(self._store), r.path)
-                if not node_edges:
+            if not all_results:
+                if crag_enabled and attempt < max_retries:
+                    current_query = self._crag_reformulate(question, "no results found")
                     continue
-                for e in node_edges:
-                    if e["direction"] == "outgoing" and e["edge_type"] in expansion_types:
-                        target = e["node"]
-                        if target not in seen_paths:
-                            target_file = self._store / target
-                            if target_file.exists():
-                                content = target_file.read_text(encoding="utf-8")
-                                if content.startswith("---\n"):
-                                    fm_end = content.find("\n---\n", 4)
-                                    if fm_end != -1:
-                                        content = content[fm_end + 5:]
-                                expanded.append(SearchResult(
-                                    path=target, score=r.score * 0.8,
-                                    content=content,
-                                    domain=target.split("/")[0] if len(target.split("/")) >= 3 else "",
-                                ))
-                                seen_paths.add(target)
-        elif edges_file.exists():
-            edges_text = edges_file.read_text()
-            for r in results[:5]:  # Expand top 5 results
-                for line in edges_text.splitlines():
-                    if line.startswith("#") or not line.strip():
-                        continue
-                    parts = line.split("\t")
-                    if len(parts) < 3:
-                        continue
-                    source, target, etype = parts[0], parts[1], parts[2]
-                    # Follow related_to, references, and derived_from edges
-                    if source == r.path and etype in expansion_types:
-                        if target not in seen_paths:
-                            target_file = self._store / target
-                            if target_file.exists():
-                                content = target_file.read_text(encoding="utf-8")
-                                # Strip frontmatter from synthesis nodes
-                                if content.startswith("---\n"):
-                                    fm_end = content.find("\n---\n", 4)
-                                    if fm_end != -1:
-                                        content = content[fm_end + 5:]
-                                expanded.append(SearchResult(
-                                    path=target, score=r.score * 0.8,
-                                    content=content,
-                                    domain=target.split("/")[0] if len(target.split("/")) >= 3 else "",
-                                ))
-                                seen_paths.add(target)
+                return AskResult(
+                    answer=None, context="", sources=[],
+                    confidence="insufficient" if crag_enabled else "unknown",
+                    retrieval_attempts=attempts,
+                )
 
-        all_results = results + expanded
+            # Graph expansion
+            expanded = self._expand_via_graph(all_results[:5], set(seen_paths))
+            working_results = all_results + expanded
+            for e in expanded:
+                seen_paths.add(e.path)
 
-        max_context = int(self._read_config("llm.max_context", "8000"))
-        context_parts = []
-        sources = []
-        tokens_used = 0
+            # Build context
+            context, sources = self._build_context(working_results)
 
-        for r in all_results:
-            chunk_tokens = int(len(r.content.split()) * 1.3)
-            if tokens_used + chunk_tokens > max_context:
+            # CRAG relevance check
+            if crag_enabled:
+                rating, gap = self._crag_relevance_check(question, context)
+                confidence = rating
+
+                if rating == "sufficient" or attempt >= max_retries:
+                    break
+                elif rating in ("partial", "insufficient"):
+                    current_query = self._crag_reformulate(question, gap)
+                    continue
+            else:
                 break
-            context_parts.append(
-                f"--- Source: {r.path} (score: {r.score:.4f}) ---\n{r.content}"
-            )
-            sources.append(r.path)
-            tokens_used += chunk_tokens
-
-        context = "\n\n".join(context_parts)
 
         if not use_llm:
-            return AskResult(answer=None, context=context, sources=sources)
+            return AskResult(
+                answer=None, context=context, sources=sources,
+                confidence=confidence, retrieval_attempts=attempts,
+            )
 
         llm_provider = self._read_config("llm.provider", "none")
         if llm_provider == "none":
-            return AskResult(answer=None, context=context, sources=sources)
+            return AskResult(
+                answer=None, context=context, sources=sources,
+                confidence=confidence, retrieval_attempts=attempts,
+            )
 
         sys.path.insert(0, str(self._ragdag_dir))
         from engines.llm import get_answer
@@ -1194,7 +1496,10 @@ class RagDag:
         if on_query != "off" and answer:
             self._file_answer(question, answer, sources)
 
-        return AskResult(answer=answer, context=context, sources=sources)
+        return AskResult(
+            answer=answer, context=context, sources=sources,
+            confidence=confidence, retrieval_attempts=attempts,
+        )
 
     def _file_answer(self, question: str, answer: str, sources: List[str]):
         """File an answer back into the store as a synthesis node."""

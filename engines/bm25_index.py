@@ -34,12 +34,13 @@ def _parse_doc(txt_file: Path, store: Path) -> Optional[dict]:
     is_stale = False
     content = raw
 
-    if is_synth and raw.startswith("---\n"):
+    if raw.startswith("---\n"):
         end = raw.find("\n---\n", 4)
         if end != -1:
             frontmatter = raw[:end]
             content = raw[end + 5:]
-            is_stale = "stale: true" in frontmatter
+            if is_synth:
+                is_stale = "stale: true" in frontmatter
 
     if not content.strip():
         return None

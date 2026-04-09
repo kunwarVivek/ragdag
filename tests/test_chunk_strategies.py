@@ -344,10 +344,11 @@ class TestAutoStrategy:
         )
         result = dag.add(str(md_file), embed=False)
         assert result["chunks"] == 2
-        # Verify stored chunks contain the headers
+        # Verify stored chunks contain the headers (strip provenance frontmatter)
+        from engines.synthesis import read_body
         store_dir = tmp_path / ".ragdag" / "doc"
-        chunk1 = (store_dir / "01.txt").read_text()
-        chunk2 = (store_dir / "02.txt").read_text()
+        chunk1 = read_body(store_dir / "01.txt")
+        chunk2 = read_body(store_dir / "02.txt")
         assert chunk1.startswith("## Section A")
         assert chunk2.startswith("## Section B")
 
